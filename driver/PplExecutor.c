@@ -339,12 +339,18 @@ PplUnload(
     PplFilterUnregisterNotify();
 
     //
-    // 2. Restore processes this driver protected, best effort.
+    // 2. Flush/discard deferred filter work before restoring. The deferred
+    //    thread must be gone before the driver image is unloaded.
+    //
+    PplFilterDrainDeferred();
+
+    //
+    // 3. Restore processes this driver protected, best effort.
     //
     PplRestoreAllTracked();
 
     //
-    // 3. Delete the control interface.
+    // 4. Delete the control interface.
     //
     if (g_SymlinkCreated) {
         RtlInitUnicodeString(&symbolicLinkName, PPL_SYMLINK_NAME);
@@ -357,7 +363,7 @@ PplUnload(
     }
 
     //
-    // 4. Clear state.
+    // 5. Clear state.
     //
     PplFilterShutdown();
 

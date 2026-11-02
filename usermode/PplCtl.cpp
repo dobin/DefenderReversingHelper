@@ -116,6 +116,43 @@ PrintProtection(
                  static_cast<unsigned>((Protection >> 3) & 1));
 }
 
+//
+// GetProcessInformation(ProcessProtectionLevelInfo) uses a different encoding
+// from the kernel's PS_PROTECTION byte. Decode it with the documented
+// PROTECTION_LEVEL_* values instead of treating it as PS_PROTECTION.
+//
+const wchar_t*
+ProtectionLevelName(
+    _In_ DWORD Level)
+{
+    switch (Level) {
+    case PROTECTION_LEVEL_NONE:
+        return L"none";
+    case PROTECTION_LEVEL_WINTCB_LIGHT:
+        return L"wintcb-light";
+    case PROTECTION_LEVEL_WINDOWS:
+        return L"windows";
+    case PROTECTION_LEVEL_WINDOWS_LIGHT:
+        return L"windows-light";
+    case PROTECTION_LEVEL_ANTIMALWARE_LIGHT:
+        return L"antimalware-light";
+    case PROTECTION_LEVEL_LSA_LIGHT:
+        return L"lsa-light";
+    case PROTECTION_LEVEL_WINTCB:
+        return L"wintcb";
+    case PROTECTION_LEVEL_CODEGEN_LIGHT:
+        return L"codegen-light";
+    case PROTECTION_LEVEL_AUTHENTICODE:
+        return L"authenticode";
+    case PROTECTION_LEVEL_PPL_APP:
+        return L"ppl-app";
+    case PROTECTION_LEVEL_SAME:
+        return L"same";
+    default:
+        return L"unknown";
+    }
+}
+
 bool
 EnablePrivilege(
     _In_ const wchar_t* Name)
@@ -471,12 +508,9 @@ PrintUserModeProtection(
 
     if (GetProcessInformation(process, ProcessProtectionLevelInfo,
                               &information, sizeof(information))) {
-        std::wprintf(L"  user-mode view : protection=0x%02X (%s/%s)\n",
-                     information.ProtectionLevel,
-                     PplProtectionTypeName(
-                         static_cast<UCHAR>(information.ProtectionLevel)),
-                     PplSignerName(static_cast<UCHAR>(
-                         (information.ProtectionLevel >> 4) & 0xF)));
+        std::wprintf(L"  user-mode view : protection=0x%08lX (%s)\n",
+                     static_cast<unsigned long>(information.ProtectionLevel),
+                     ProtectionLevelName(information.ProtectionLevel));
     } else {
         DWORD error = GetLastError();
         std::wprintf(L"  user-mode view : GetProcessInformation failed: %lu (%s)\n",

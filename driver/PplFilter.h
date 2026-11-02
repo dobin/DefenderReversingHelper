@@ -6,6 +6,7 @@
 NTSTATUS PplFilterInitialize(VOID);
 NTSTATUS PplFilterRegisterNotify(VOID);
 VOID PplFilterUnregisterNotify(VOID);
+VOID PplFilterDrainDeferred(VOID);
 VOID PplFilterShutdown(VOID);
 
 BOOLEAN PplFilterNotifyRegistered(VOID);

@@ -99,6 +99,8 @@ PplNtStatusText(
         return L"STATUS_OBJECT_NAME_NOT_FOUND";
     case 0xC0000035UL:
         return L"STATUS_OBJECT_NAME_COLLISION";
+    case 0xC0000225UL:
+        return L"STATUS_NOT_FOUND";
     case 0xC00000BBUL:
         return L"STATUS_NOT_SUPPORTED";
     case 0xC0000001UL:

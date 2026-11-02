@@ -19,7 +19,8 @@ Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/K
 
 - **PID:** `pplctl set --pid <pid>` / `clear` / `query` / `probe`
 - **Name filter:** a process-creation callback protects every new image whose base name
-  matches a pattern; `--apply-existing` handles already-running processes
+  matches a pattern (protection is applied by a deferred driver thread shortly after
+  creation); `--apply-existing` handles already-running processes
 - **On-connect:** an admin-owned named-pipe broker (`\\.\pipe\PplGrant`) resolves the
   connecting client's PID with `GetNamedPipeClientProcessId` and grants PPL
 - Configurable signer, default Antimalware
@@ -292,8 +293,12 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   processes are skipped. A driver crash or forced unload can leave processes PPL until
   reboot; reboot is the recovery path.
 - **Filter callback.** The callback is allocation-free, does not wait on I/O, and never
-  sets `CreationStatus`. It copies the matched filter, releases the filter lock, and then
-  applies protection. Blocklisted images are skipped.
+  sets `CreationStatus`. It copies the matched filter and queues the PID for a driver
+  system thread, which applies protection about 100 ms later. Applying PPL directly in
+  the callback makes the parent's `CreateProcess` fail with access denied, because the
+  parent's handle is opened after the notification returns. Blocklisted images are
+  skipped. The deferred queue is drained before unload so no work item can outlive the
+  driver image.
 - **Blocklist.** PID 0/4 and `System`, `Registry`, `smss.exe`, `csrss.exe`,
   `wininit.exe`, `services.exe`, `lsass.exe`, `winlogon.exe` are refused. Apply-existing
   also skips the calling CLI process. The explicit PID path is intentionally more

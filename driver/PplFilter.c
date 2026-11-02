@@ -54,12 +54,56 @@ static volatile BOOLEAN    g_NotifyRegistered;
 static PPL_PS_GET_PROCESS_IMAGE_FILE_NAME g_PsGetProcessImageFileName;
 static PPL_QUERY_SYSTEM_INFORMATION       g_QuerySystemInformation;
 
+//
+// Protection requested from the process-creation callback is deferred. Setting
+// PS_PROTECTION while the callback is still running makes the creating
+// process's CreateProcess call fail with STATUS_ACCESS_DENIED, because the
+// parent's handle is opened after the notification. A small system thread
+// applies the pending entries a short time later, once creation has finished.
+//
+#define PPL_MAX_PENDING_PROTECTIONS 256
+
+typedef struct _PPL_PENDING_PROTECTION {
+    ULONG ProcessId;
+    UCHAR Signer;
+    UCHAR Audit;
+    UCHAR Reserved[2];
+} PPL_PENDING_PROTECTION;
+
+static KSPIN_LOCK   g_PendingLock;
+static PPL_PENDING_PROTECTION g_Pending[PPL_MAX_PENDING_PROTECTIONS];
+static ULONG        g_PendingHead;
+static ULONG        g_PendingTail;
+static ULONG        g_PendingCount;
+static BOOLEAN      g_FilterShuttingDown;
+static BOOLEAN      g_DeferredStopped;
+
+static KEVENT       g_DeferredWakeEvent;
+static HANDLE       g_DeferredThreadHandle;
+static PETHREAD     g_DeferredThread;
+
 static
 VOID
 PplCreateProcessNotifyEx(
     _Inout_ PEPROCESS Process,
     _In_ HANDLE ProcessId,
     _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
+
+static
+VOID
+PplpDeferredProtectionThread(
+    _In_ PVOID Context);
+
+//
+// Declared in ntifs.h, which this driver does not include. Only used on the
+// unlikely path where referencing the newly created system thread fails.
+//
+NTKERNELAPI
+NTSTATUS
+ZwWaitForSingleObject(
+    _In_ HANDLE Handle,
+    _In_ BOOLEAN Alertable,
+    _In_opt_ PLARGE_INTEGER Timeout);
 
 static const WCHAR* const g_BlockedNames[] = {
     L"System",
@@ -484,15 +528,163 @@ PplpApplyExisting(
     return STATUS_SUCCESS;
 }
 
+static
+VOID
+PplpQueueDeferredProtection(
+    _In_ ULONG ProcessId,
+    _In_ UCHAR Signer,
+    _In_ UCHAR Audit)
+{
+    KIRQL oldIrql;
+    BOOLEAN full = FALSE;
+    BOOLEAN shuttingDown = FALSE;
+
+    KeAcquireSpinLock(&g_PendingLock, &oldIrql);
+
+    if (g_FilterShuttingDown) {
+        shuttingDown = TRUE;
+    } else if (g_PendingCount >= PPL_MAX_PENDING_PROTECTIONS) {
+        full = TRUE;
+    } else {
+        g_Pending[g_PendingTail].ProcessId = ProcessId;
+        g_Pending[g_PendingTail].Signer = Signer;
+        g_Pending[g_PendingTail].Audit = Audit;
+        g_Pending[g_PendingTail].Reserved[0] = 0;
+        g_Pending[g_PendingTail].Reserved[1] = 0;
+        g_PendingTail = (g_PendingTail + 1) % PPL_MAX_PENDING_PROTECTIONS;
+        ++g_PendingCount;
+    }
+
+    KeReleaseSpinLock(&g_PendingLock, oldIrql);
+
+    if (shuttingDown) {
+        PPL_LOG("filter match pid=%lu ignored during shutdown", ProcessId);
+    } else if (full) {
+        PPL_LOG("deferred protection queue full; pid=%lu not protected", ProcessId);
+    } else {
+        KeSetEvent(&g_DeferredWakeEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+static
+VOID
+PplpDeferredProtectionThread(
+    _In_ PVOID Context)
+{
+    LARGE_INTEGER timeout;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    for (;;) {
+        KeWaitForSingleObject(&g_DeferredWakeEvent, Executive, KernelMode,
+                              FALSE, NULL);
+        KeResetEvent(&g_DeferredWakeEvent);
+
+        if (g_FilterShuttingDown) {
+            break;
+        }
+
+        //
+        // The creation notification runs before the parent's handle to the new
+        // process is opened. Give CreateProcess time to finish before applying
+        // PPL; otherwise the parent gets access denied.
+        //
+        timeout.QuadPart = -1000000LL; // 100 ms (100ns units)
+        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+
+        for (;;) {
+            PPL_PENDING_PROTECTION entry;
+            KIRQL oldIrql;
+            BOOLEAN haveEntry = FALSE;
+            PEPROCESS process = NULL;
+            NTSTATUS status;
+            PPL_OPERATION_RESULT result;
+
+            RtlZeroMemory(&entry, sizeof(entry));
+            KeAcquireSpinLock(&g_PendingLock, &oldIrql);
+            if (!g_FilterShuttingDown && g_PendingCount != 0) {
+                entry = g_Pending[g_PendingHead];
+                g_PendingHead = (g_PendingHead + 1) % PPL_MAX_PENDING_PROTECTIONS;
+                --g_PendingCount;
+                haveEntry = TRUE;
+            }
+            KeReleaseSpinLock(&g_PendingLock, oldIrql);
+
+            if (!haveEntry) {
+                break;
+            }
+
+            status = PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)entry.ProcessId, &process);
+            if (!NT_SUCCESS(status)) {
+                PPL_LOG("deferred filter pid=%lu lookup failed: 0x%08X",
+                        entry.ProcessId, status);
+                continue;
+            }
+
+            RtlZeroMemory(&result, sizeof(result));
+            status = PplProtectProcess(process, entry.ProcessId,
+                                       entry.Signer, entry.Audit, &result);
+            PPL_LOG("deferred filter pid=%lu old=0x%02X new=0x%02X status=0x%08X",
+                    entry.ProcessId, result.OldProtection,
+                    result.NewProtection, status);
+            ObDereferenceObject(process);
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+VOID
+PplFilterDrainDeferred(VOID)
+{
+    KIRQL oldIrql;
+
+    if (!g_FilterInitialized || g_DeferredStopped) {
+        return;
+    }
+
+    KeAcquireSpinLock(&g_PendingLock, &oldIrql);
+    g_FilterShuttingDown = TRUE;
+    g_PendingHead = 0;
+    g_PendingTail = 0;
+    g_PendingCount = 0;
+    KeReleaseSpinLock(&g_PendingLock, oldIrql);
+
+    KeSetEvent(&g_DeferredWakeEvent, IO_NO_INCREMENT, FALSE);
+
+    if (g_DeferredThread != NULL) {
+        KeWaitForSingleObject(g_DeferredThread, Executive, KernelMode,
+                              FALSE, NULL);
+        ObDereferenceObject(g_DeferredThread);
+        g_DeferredThread = NULL;
+    }
+
+    g_DeferredStopped = TRUE;
+}
+
 NTSTATUS
 PplFilterInitialize(VOID)
 {
     UNICODE_STRING routineName;
+    NTSTATUS status;
 
     ExInitializePushLock(&g_FilterLock);
     RtlZeroMemory(g_Filters, sizeof(g_Filters));
     g_FilterCount = 0;
     g_NotifyRegistered = FALSE;
+
+    KeInitializeSpinLock(&g_PendingLock);
+    RtlZeroMemory(g_Pending, sizeof(g_Pending));
+    g_PendingHead = 0;
+    g_PendingTail = 0;
+    g_PendingCount = 0;
+    g_FilterShuttingDown = FALSE;
+    g_DeferredStopped = FALSE;
+    g_DeferredThread = NULL;
+    g_DeferredThreadHandle = NULL;
+    KeInitializeEvent(&g_DeferredWakeEvent, NotificationEvent, FALSE);
+
     g_FilterInitialized = TRUE;
 
     RtlInitUnicodeString(&routineName, L"PsGetProcessImageFileName");
@@ -515,6 +707,41 @@ PplFilterInitialize(VOID)
     if (g_QuerySystemInformation == NULL) {
         PPL_LOG("warning: system process enumeration unavailable; apply-existing disabled");
     }
+
+    status = PsCreateSystemThread(
+        &g_DeferredThreadHandle,
+        THREAD_ALL_ACCESS,
+        NULL,
+        NULL,
+        NULL,
+        PplpDeferredProtectionThread,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        PPL_LOG("PsCreateSystemThread failed: 0x%08X", status);
+        g_FilterInitialized = FALSE;
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle(
+        g_DeferredThreadHandle,
+        THREAD_ALL_ACCESS,
+        NULL,
+        KernelMode,
+        (PVOID*)&g_DeferredThread,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        PPL_LOG("ObReferenceObjectByHandle(thread) failed: 0x%08X", status);
+        g_FilterShuttingDown = TRUE;
+        KeSetEvent(&g_DeferredWakeEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(g_DeferredThreadHandle, FALSE, NULL);
+        ZwClose(g_DeferredThreadHandle);
+        g_DeferredThreadHandle = NULL;
+        g_FilterInitialized = FALSE;
+        return status;
+    }
+
+    ZwClose(g_DeferredThreadHandle);
+    g_DeferredThreadHandle = NULL;
 
     return STATUS_SUCCESS;
 }
@@ -766,6 +993,8 @@ PplFilterShutdown(VOID)
         return;
     }
 
+    PplFilterDrainDeferred();
+
     ExAcquirePushLockExclusive(&g_FilterLock);
     RtlZeroMemory(g_Filters, sizeof(g_Filters));
     g_FilterCount = 0;
@@ -785,8 +1014,6 @@ PplCreateProcessNotifyEx(
     PPL_INTERNAL_FILTER matched;
     BOOLEAN found = FALSE;
     ULONG i;
-    NTSTATUS status;
-    PPL_OPERATION_RESULT result;
 
     if (!g_NotifyRegistered) {
         return;
@@ -852,11 +1079,12 @@ PplCreateProcessNotifyEx(
         return;
     }
 
-    RtlZeroMemory(&result, sizeof(result));
-    status = PplProtectProcess(Process, pid, matched.Signer,
-                               matched.Audit, &result);
-
-    PPL_LOG("filter matched pid=%lu image=%wZ old=0x%02X new=0x%02X status=0x%08X",
-            pid, CreateInfo->ImageFileName,
-            result.OldProtection, result.NewProtection, status);
+    //
+    // Do not write PS_PROTECTION here: the creating process has not finished
+    // opening its handle to this process yet, and a PPL process would make
+    // CreateProcess fail. Queue the PID for the deferred thread instead.
+    //
+    PPL_LOG("filter matched pid=%lu image=%wZ; queued for deferred protection",
+            pid, CreateInfo->ImageFileName);
+    PplpQueueDeferredProtection(pid, matched.Signer, matched.Audit);
 }
