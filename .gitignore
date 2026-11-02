@@ -1,0 +1,9 @@
+bin/
+obj/
+certs/
+test-artifacts/
+.vs/
+*.user
+*.suo
+*.pfx
+*.cer
