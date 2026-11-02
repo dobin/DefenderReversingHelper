@@ -1,4 +1,5 @@
 #include "PplDriverClient.h"
+#include "PplBuilds.h"
 
 #include <sddl.h>
 
@@ -39,6 +40,7 @@ PrintUsage()
         L"  pplctl filter list\n"
         L"  pplctl broker  [--pipe PplGrant] [--signer am] [--audit] [--once] [--allow-all]\n"
         L"  pplctl connect [--pipe PplGrant] [--hold <seconds>]\n"
+        L"  pplctl builds\n"
         L"  pplctl version\n"
         L"\n"
         L"Default signer is antimalware (PPL-Antimalware, protection byte 0x31).\n"
@@ -173,6 +175,46 @@ IsBlockedImageName(
     return false;
 }
 
+ULONG
+QueryCurrentBuild()
+{
+    typedef LONG (WINAPI* RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+    RTL_OSVERSIONINFOW version = {};
+    RtlGetVersionFn rtlGetVersion;
+
+#pragma warning(push)
+#pragma warning(disable: 4191) // unsafe conversion from FARPROC
+    rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+#pragma warning(pop)
+
+    if (rtlGetVersion == nullptr) {
+        return 0;
+    }
+
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (rtlGetVersion(&version) != 0) {
+        return 0;
+    }
+
+    return version.dwBuildNumber;
+}
+
+std::wstring
+OffsetOrDash(
+    _In_ ULONG Offset)
+{
+    wchar_t buffer[16];
+
+    if (Offset == 0) {
+        return L"-";
+    }
+
+    swprintf_s(buffer, _countof(buffer), L"0x%03lX",
+               static_cast<unsigned long>(Offset));
+    return buffer;
+}
+
 int
 CommandInfo()
 {
@@ -196,12 +238,35 @@ CommandInfo()
                  PplNtStatusText(info.Status).c_str(),
                  static_cast<unsigned long>(info.Status));
     std::wprintf(L"version       : %s\n", info.Version);
-    std::wprintf(L"build         : %lu\n", info.BuildNumber);
-    std::wprintf(L"PPL offset    : 0x%03lX%s\n",
-                 info.ProtectionOffset,
+    std::wprintf(L"OS            : %s (%lu.%lu build %lu)\n",
+                 PplBuildDisplayName(info.BuildNumber),
+                 static_cast<unsigned long>(info.MajorVersion),
+                 static_cast<unsigned long>(info.MinorVersion),
+                 static_cast<unsigned long>(info.BuildNumber));
+    std::wprintf(L"PPL offset    : %s%s\n",
+                 OffsetOrDash(info.ProtectionOffset).c_str(),
                  (info.Flags & PPL_INFO_FLAG_OFFSET_SUPPORTED)
                      ? L""
                      : L" (unsupported build)");
+
+    {
+        PPL_BUILD_OFFSETS local = {};
+
+        if (PplLookupBuildOffsets(info.BuildNumber, &local) &&
+            local.PsProtectionOffset != 0 &&
+            local.PsProtectionOffset != info.ProtectionOffset) {
+            std::wprintf(
+                L"warning       : driver offset 0x%03lX differs from the pplctl "
+                L"table 0x%03lX\n",
+                static_cast<unsigned long>(info.ProtectionOffset),
+                static_cast<unsigned long>(local.PsProtectionOffset));
+        }
+    }
+
+    std::wprintf(L"EPROCESS      : mit1=%s mit2=%s objtbl=%s (diagnostic)\n",
+                 OffsetOrDash(info.MitigationFlags1Offset).c_str(),
+                 OffsetOrDash(info.MitigationFlags2Offset).c_str(),
+                 OffsetOrDash(info.ObjectTableOffset).c_str());
     std::wprintf(L"max filters   : %lu\n", info.MaxFilters);
     std::wprintf(L"notify callback: %s\n",
                  (info.Flags & PPL_INFO_FLAG_NOTIFY_REGISTERED)
@@ -209,6 +274,62 @@ CommandInfo()
                      : L"not registered");
 
     return PplNtSuccess(info.Status) ? 0 : 1;
+}
+
+int
+CommandBuilds()
+{
+    ULONG count = 0;
+    const PPL_BUILD_OFFSETS* table = PplGetBuildOffsetTable(&count);
+    ULONG currentBuild = QueryCurrentBuild();
+    PPL_BUILD_OFFSETS currentOffsets = {};
+    bool currentSupported = false;
+
+    std::wprintf(L"compiled offset table : %lu builds\n", count);
+
+    if (currentBuild != 0) {
+        std::wprintf(L"current OS            : %s (build %lu)\n",
+                     PplBuildDisplayName(currentBuild),
+                     static_cast<unsigned long>(currentBuild));
+
+        currentSupported =
+            PplLookupBuildOffsets(currentBuild, &currentOffsets) &&
+            currentOffsets.PsProtectionOffset != 0;
+    } else {
+        std::wprintf(L"current OS            : unknown (RtlGetVersion failed)\n");
+    }
+
+    std::wprintf(L"\n  %-1s %-6s %-31s %-7s %-7s %-7s %-7s\n",
+                 L"", L"build", L"Windows version", L"PPL",
+                 L"mit1", L"mit2", L"objtbl");
+
+    for (ULONG i = 0; i < count; ++i) {
+        const PPL_BUILD_OFFSETS& entry = table[i];
+
+        std::wprintf(L"  %-1s %-6lu %-31s %-7s %-7s %-7s %-7s\n",
+                     (entry.BuildNumber == currentBuild) ? L"*" : L"",
+                     static_cast<unsigned long>(entry.BuildNumber),
+                     PplBuildDisplayName(entry.BuildNumber),
+                     OffsetOrDash(entry.PsProtectionOffset).c_str(),
+                     OffsetOrDash(entry.PsMitigationFlags1Offset).c_str(),
+                     OffsetOrDash(entry.PsMitigationFlags2Offset).c_str(),
+                     OffsetOrDash(entry.ObjectTableOffset).c_str());
+    }
+
+    if (currentBuild == 0) {
+        return 0;
+    }
+
+    std::wprintf(L"\ncurrent build PPL support: %s\n",
+                 currentSupported ? L"yes" : L"no");
+    if (currentSupported) {
+        std::wprintf(L"  PS_PROTECTION offset: %s\n",
+                     OffsetOrDash(currentOffsets.PsProtectionOffset).c_str());
+    } else {
+        std::wprintf(L"  Unknown builds are refused; add an entry to shared/PplBuilds.c.\n");
+    }
+
+    return currentSupported ? 0 : 1;
 }
 
 int
@@ -411,7 +532,9 @@ CommandQuery(int argc, wchar_t** argv)
                  static_cast<unsigned long>(result.Status));
 
     if (PplNtSuccess(result.Status)) {
-        std::wprintf(L"  build          : %lu\n", result.BuildNumber);
+        std::wprintf(L"  build          : %lu (%s)\n",
+                     static_cast<unsigned long>(result.BuildNumber),
+                     PplBuildDisplayName(result.BuildNumber));
         std::wprintf(L"  PPL offset     : 0x%03lX\n", result.ProtectionOffset);
         std::wprintf(L"  protection     : ");
         PrintProtection(result.Protection);
@@ -1038,8 +1161,18 @@ wmain(
     if (_wcsicmp(argv[1], L"connect") == 0) {
         return CommandConnect(argc, argv);
     }
+    if (_wcsicmp(argv[1], L"builds") == 0) {
+        return CommandBuilds();
+    }
     if (_wcsicmp(argv[1], L"version") == 0) {
+        ULONG build = QueryCurrentBuild();
+
         std::wprintf(L"PplExecutor %s\n", PPL_DRIVER_VERSION);
+        if (build != 0) {
+            std::wprintf(L"OS: %s (build %lu)\n",
+                         PplBuildDisplayName(build),
+                         static_cast<unsigned long>(build));
+        }
         return 0;
     }
     if (_wcsicmp(argv[1], L"help") == 0 ||

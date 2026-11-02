@@ -288,6 +288,11 @@ PplpDeviceControl(
         info->BuildNumber = g_PplBuildNumber;
         info->ProtectionOffset = g_PplProtectionOffset;
         info->MaxFilters = PPL_MAX_FILTERS;
+        info->MajorVersion = g_PplMajorVersion;
+        info->MinorVersion = g_PplMinorVersion;
+        info->MitigationFlags1Offset = g_PplOffsets.PsMitigationFlags1Offset;
+        info->MitigationFlags2Offset = g_PplOffsets.PsMitigationFlags2Offset;
+        info->ObjectTableOffset = g_PplOffsets.ObjectTableOffset;
         info->Flags = (PplFilterNotifyRegistered()
                            ? PPL_INFO_FLAG_NOTIFY_REGISTERED
                            : 0) |
@@ -405,8 +410,10 @@ DriverEntry(
     //
     (VOID)PplFilterRegisterNotify();
 
-    PPL_LOG("loaded, build %lu, offset 0x%03lX",
-            g_PplBuildNumber, g_PplProtectionOffset);
+    PPL_LOG("loaded, build %lu (%ws), PPL offset 0x%03lX",
+            g_PplBuildNumber,
+            PplBuildDisplayName(g_PplBuildNumber),
+            g_PplProtectionOffset);
 
     return STATUS_SUCCESS;
 }

@@ -11,26 +11,19 @@ typedef BOOLEAN (NTAPI *PPL_PS_IS_PROTECTED_PROCESS)(_In_ PEPROCESS Process);
 static PPL_PS_IS_PROTECTED_PROCESS        g_PsIsProtectedProcess;
 static PPL_PS_IS_PROTECTED_PROCESS        g_PsIsProtectedProcessLight;
 
+ULONG   g_PplMajorVersion;
+ULONG   g_PplMinorVersion;
 ULONG   g_PplBuildNumber;
 ULONG   g_PplProtectionOffset;
 BOOLEAN g_PplOffsetSupported;
-
-typedef struct _PPL_OFFSET_ENTRY {
-    ULONG BuildNumber;
-    ULONG ProtectionOffset;
-} PPL_OFFSET_ENTRY;
+PPL_BUILD_OFFSETS g_PplOffsets;
 
 //
-// Build-specific EPROCESS!PS_PROTECTION offsets. Never guess: an unknown
-// build must fail SET/FILTER rather than corrupt an arbitrary EPROCESS byte.
+// Build-specific EPROCESS offsets live in shared/PplBuilds.c. They are ported
+// from KDU's KDUGetEprocessOffsets and cover Windows 8.1 through Windows 11
+// 25H2. An unknown build must fail SET/FILTER rather than corrupt an
+// arbitrary EPROCESS byte.
 //
-static const PPL_OFFSET_ENTRY g_PplOffsets[] = {
-    { 22000, 0x87A },   // Windows 11 21H2
-    { 22621, 0x87A },   // Windows 11 22H2
-    { 22631, 0x87A },   // Windows 11 23H2
-    { 26100, 0x5FA },   // Windows 11 24H2
-    { 26200, 0x5FA },   // Windows 11 25H2
-};
 
 #define PPL_MAX_TRACKED_PROCESSES 256
 
@@ -80,6 +73,11 @@ PplpWriteProtection(
 {
     volatile UCHAR* target;
 
+    //
+    // KDU reads a ULONG at PsProtectionOffset and writes back only the low
+    // byte with the signer/type bits replaced. Writing the single UCHAR here
+    // is equivalent and guarantees the other EPROCESS bytes are untouched.
+    //
     target = (volatile UCHAR*)((PUCHAR)Process + g_PplProtectionOffset);
     *target = Value;
     KeMemoryBarrier();
@@ -244,12 +242,29 @@ PplpDropTrackByPid(
     ExReleasePushLockExclusive(&g_TrackLock);
 }
 
+//
+// KUSER_SHARED_DATA is mapped read-only at a fixed address in kernel mode.
+// NtBuildNumber is at offset 0x260 (the WDK C_ASSERTs that offset). KDU reads
+// the same value through NtCurrentPeb()->OSBuildNumber. RtlGetVersion is the
+// primary source; this is a cross-check that also works if a shim or hook has
+// changed the RtlGetVersion result.
+//
+static
+ULONG
+PplpQuerySharedBuildNumber(VOID)
+{
+    PKUSER_SHARED_DATA shared = (PKUSER_SHARED_DATA)0xFFFFF78000000000ULL;
+
+    return shared->NtBuildNumber;
+}
+
 NTSTATUS
 PplProtectionInitialize(VOID)
 {
     RTL_OSVERSIONINFOW version;
+    PPL_BUILD_OFFSETS offsets;
     NTSTATUS status;
-    ULONG i;
+    ULONG sharedBuild;
 
     ExInitializePushLock(&g_TrackLock);
     RtlZeroMemory(g_Track, sizeof(g_Track));
@@ -263,30 +278,56 @@ PplProtectionInitialize(VOID)
         return status;
     }
 
+    g_PplMajorVersion = version.dwMajorVersion;
+    g_PplMinorVersion = version.dwMinorVersion;
     g_PplBuildNumber = version.dwBuildNumber;
+
+    sharedBuild = PplpQuerySharedBuildNumber();
+    if (sharedBuild != 0 && sharedBuild != g_PplBuildNumber) {
+        PPL_LOG("build mismatch: RtlGetVersion=%lu, KUSER_SHARED_DATA=%lu; using %lu",
+                g_PplBuildNumber, sharedBuild, sharedBuild);
+        g_PplBuildNumber = sharedBuild;
+    }
+
+    RtlZeroMemory(&g_PplOffsets, sizeof(g_PplOffsets));
+    g_PplOffsets.BuildNumber = g_PplBuildNumber;
     g_PplProtectionOffset = 0;
     g_PplOffsetSupported = FALSE;
 
-    for (i = 0; i < RTL_NUMBER_OF(g_PplOffsets); ++i) {
-        if (g_PplOffsets[i].BuildNumber == version.dwBuildNumber) {
-            g_PplProtectionOffset = g_PplOffsets[i].ProtectionOffset;
-            g_PplOffsetSupported = TRUE;
-            break;
-        }
+    if (g_PplBuildNumber < PPL_MIN_SUPPORTED_BUILD) {
+        PPL_LOG("build %lu (%ws) predates PPL (Windows 8.1); SET and FILTER disabled",
+                g_PplBuildNumber,
+                PplBuildDisplayName(g_PplBuildNumber));
+    } else if (!PplLookupBuildOffsets(g_PplBuildNumber, &offsets) ||
+               offsets.PsProtectionOffset == 0)
+    {
+        //
+        // Never guess an offset. Known-but-unmapped builds (for example
+        // 26H1/26H2) and future builds land here; the driver stays loaded
+        // but SET/FILTER return STATUS_NOT_SUPPORTED.
+        //
+        PPL_LOG("no known EPROCESS offsets for build %lu (%ws); SET and FILTER disabled",
+                g_PplBuildNumber,
+                PplBuildDisplayName(g_PplBuildNumber));
+    } else {
+        g_PplOffsets = offsets;
+        g_PplProtectionOffset = offsets.PsProtectionOffset;
+        g_PplOffsetSupported = TRUE;
+
+        PPL_LOG("build %lu (%ws), PS_PROTECTION offset 0x%03lX",
+                g_PplBuildNumber,
+                PplBuildDisplayName(g_PplBuildNumber),
+                g_PplProtectionOffset);
+        PPL_LOG("EPROCESS offsets: MitigationFlags1=0x%03lX MitigationFlags2=0x%03lX ObjectTable=0x%03lX",
+                g_PplOffsets.PsMitigationFlags1Offset,
+                g_PplOffsets.PsMitigationFlags2Offset,
+                g_PplOffsets.ObjectTableOffset);
     }
 
     g_PsIsProtectedProcess =
         (PPL_PS_IS_PROTECTED_PROCESS)PplpGetSystemRoutine(L"PsIsProtectedProcess");
     g_PsIsProtectedProcessLight =
         (PPL_PS_IS_PROTECTED_PROCESS)PplpGetSystemRoutine(L"PsIsProtectedProcessLight");
-
-    if (g_PplOffsetSupported) {
-        PPL_LOG("build %lu, PS_PROTECTION offset 0x%03lX",
-                g_PplBuildNumber, g_PplProtectionOffset);
-    } else {
-        PPL_LOG("unsupported build %lu; SET and FILTER disabled",
-                g_PplBuildNumber);
-    }
 
     if (g_PsIsProtectedProcess == NULL || g_PsIsProtectedProcessLight == NULL) {
         PPL_LOG("warning: PsIsProtectedProcess exports unavailable; byte readback only");

@@ -84,12 +84,14 @@
     <ClCompile Include="PplExecutor.c" />
     <ClCompile Include="PplFilter.c" />
     <ClCompile Include="PplProtection.c" />
+    <ClCompile Include="..\shared\PplBuilds.c" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="PplFilter.h" />
     <ClInclude Include="PplLog.h" />
     <ClInclude Include="PplProtection.h" />
+    <ClInclude Include="..\shared\PplBuilds.h" />
     <ClInclude Include="..\shared\PplIoctl.h" />
   </ItemGroup>
 

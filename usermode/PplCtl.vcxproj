@@ -73,10 +73,12 @@
   <ItemGroup>
     <ClCompile Include="PplCtl.cpp" />
     <ClCompile Include="PplDriverClient.cpp" />
+    <ClCompile Include="..\shared\PplBuilds.c" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="PplDriverClient.h" />
+    <ClInclude Include="..\shared\PplBuilds.h" />
     <ClInclude Include="..\shared\PplIoctl.h" />
   </ItemGroup>
 

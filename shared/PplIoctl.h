@@ -13,7 +13,7 @@ typedef LONG NTSTATUS;
 #define PPL_USER_NTSTATUS_DEFINED
 #endif
 
-#define PPL_DRIVER_VERSION          L"1.0.0"
+#define PPL_DRIVER_VERSION          L"1.1.0"
 #define PPL_DEVICE_NAME             L"\\Device\\PplExecutor"
 #define PPL_SYMLINK_NAME            L"\\??\\PplExecutor"
 #define PPL_WIN32_DEVICE            L"\\\\.\\PplExecutor"
@@ -134,4 +134,16 @@ typedef struct _PPL_DRIVER_INFO {
     ULONG MaxFilters;
     ULONG Flags;        // PPL_INFO_FLAG_*
     WCHAR Version[32];
+
+    //
+    // Added in 1.1.0. The driver reports the full NT version it detected and
+    // the EPROCESS offsets from its build table. Only ProtectionOffset is
+    // used to set PPL; the rest are diagnostics.
+    //
+    ULONG MajorVersion;
+    ULONG MinorVersion;
+    ULONG MitigationFlags1Offset;
+    ULONG MitigationFlags2Offset;
+    ULONG ObjectTableOffset;
+    ULONG Reserved;
 } PPL_DRIVER_INFO, *PPPL_DRIVER_INFO;

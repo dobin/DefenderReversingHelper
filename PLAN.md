@@ -65,6 +65,7 @@ ppl_executor/
   README.md                     # written after implementation
   shared/
     PplIoctl.h                  # IOCTLs + structs shared by driver and CLI
+    PplBuilds.c/.h              # NT builds + EPROCESS offsets (ported from KDU)
   driver/
     PplExecutor.vcxproj
     PplExecutor.c               # DriverEntry, unload, device, IRP dispatch
@@ -258,20 +259,20 @@ Convention: malformed buffers return `STATUS_INVALID_PARAMETER` /
 
 ### 5.2 Protection offset
 
-```c
-static const struct { ULONG Build; ULONG Offset; } g_PplOffsets[] = {
-    { 22000, 0x87A },   // Win11 21H2
-    { 22621, 0x87A },   // Win11 22H2
-    { 22631, 0x87A },   // Win11 23H2
-    { 26100, 0x5FA },   // Win11 24H2  <-- this host
-    { 26200, 0x5FA },   // Win11 25H2
-};
-```
+The table lives in `shared/PplBuilds.c` so the driver and `pplctl builds` share one
+source of truth. It is ported from KDU's `KDUGetEprocessOffsets`
+(`Source/Hamakaze/ps.cpp`) and `PsProtectionOffset_*` (`Source/Hamakaze/ps.h`), and
+covers Windows 8.1 (9600) through Windows 11 25H2 (26200), including `0x87A` for
+19041-22631 and `0x5FA` for 26100-26200. Mitigation-flags and object-table offsets are
+stored alongside for diagnostics.
 
-- Use `RtlGetVersion` in `DriverEntry`.
-- If the build is unknown, load the driver but set offset 0 and make `SET`/`FILTER`
-  return `STATUS_NOT_SUPPORTED`. `GET_INFO` reports the unsupported build. Do **not**
-  guess an offset; a wrong write corrupts `EPROCESS`.
+- Identify the build with `RtlGetVersion` in `DriverEntry` and cross-check
+  `KUSER_SHARED_DATA->NtBuildNumber` (the value KDU reads through
+  `NtCurrentPeb()->OSBuildNumber`).
+- Look up the exact build number. If it is unknown (including 26H1/26H2, which KDU does
+  not map yet), load the driver but set offset 0 and make `SET`/`FILTER` return
+  `STATUS_NOT_SUPPORTED`. `GET_INFO` reports the unsupported build. Do **not** guess an
+  offset; a wrong write corrupts `EPROCESS`.
 - Do not make RedEdr's 3-byte `SignatureLevel/SectionSignatureLevel/Protection` scanner
   the primary path. For a freshly created, unprotected process those bytes can all be
   zero, so the scan is ambiguous. Use the build table and verify with
@@ -651,8 +652,9 @@ Debugging aids:
 
 ## 9. Risks and Limitations
 
-- **Offsets are build-specific.** `0x5FA` is for 26100/26200; `0x87A` is for 22000–22631.
-  A wrong offset corrupts `EPROCESS`. Never guess on an unknown build; update the table.
+- **Offsets are build-specific.** The KDU-derived table covers 9600-26200; `0x5FA` is for
+  26100/26200 and `0x87A` for 19041-22631. A wrong offset corrupts `EPROCESS`. Never
+  guess on an unknown build; update `shared/PplBuilds.c`.
 - **DKOM is unsupported.** Microsoft does not support direct `EPROCESS` modification.
   Treat this as a test/research tool, not a production security product.
 - **PPL is not kernel protection.** Kernel-mode code can still manipulate the process.

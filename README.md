@@ -12,6 +12,9 @@ reboots.
 The default protection is **PPL-Antimalware** (`0x31`). PPL-WinTcb (`0x61`) is available
 but can lock administrators and debugging tools out of a process.
 
+Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/KDU. 
+
+
 ## Features
 
 - **PID:** `pplctl set --pid <pid>` / `clear` / `query` / `probe`
@@ -33,6 +36,7 @@ files, or persists state.
 ppl_executor/
   PplExecutor.sln
   shared/PplIoctl.h             shared IOCTLs and structs
+  shared/PplBuilds.c/.h         NT build numbers + EPROCESS offset table
   driver/
     PplExecutor.vcxproj
     PplExecutor.c               DriverEntry, control device, IOCTL dispatch
@@ -59,7 +63,8 @@ ppl_executor/
 
 ## Prerequisites
 
-- Windows 11 x64 test VM (this code's known offsets are for builds 22000-26200)
+- Windows x64 test VM. The offset table covers Windows 8.1 through Windows 11
+  25H2 and is ported from KDU; Windows 11 24H2/25H2 is the tested target
 - Visual Studio 2022 with the **Desktop development with C++** workload
 - Windows SDK **10.0.26100.0**
 - Windows Driver Kit for SDK **10.0.26100.0**, including the
@@ -222,8 +227,13 @@ pplctl filter clear
 pplctl filter list
 pplctl broker  [--pipe PplGrant] [--signer am] [--audit] [--once] [--allow-all]
 pplctl connect [--pipe PplGrant] [--hold <seconds>]
+pplctl builds
 pplctl version
 ```
+
+`builds` prints the build table compiled into `pplctl`, marks the running OS, and
+shows whether the current build has a known `PS_PROTECTION` offset. It does not need
+the driver to be loaded.
 
 Default signer is `am` (Antimalware). Supported protection bytes include:
 
@@ -238,8 +248,8 @@ Default signer is `am` (Antimalware). Supported protection bytes include:
 | WinSystem | `0x71` |
 | App | `0x81` |
 
-`query` prints the driver's raw byte, decoded type/signer/audit, build, offset, and the
-`PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
+`query` prints the driver's raw byte, decoded type/signer/audit, build name, offset, and
+the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 `GetProcessInformation(ProcessProtectionLevelInfo)` to show the user-mode view.
 
 `probe` enables `SeDebugPrivilege` first, then tests:
@@ -250,9 +260,18 @@ Default signer is `am` (Antimalware). Supported protection bytes include:
 
 ## Design notes
 
-- **Offset table only.** Known offsets are `0x87A` for 22000/22621/22631 and `0x5FA` for
-  26100/26200. Unknown builds load but `SET`/`FILTER` return `STATUS_NOT_SUPPORTED`.
-  The driver deliberately does not guess or scan for the field on an unknown build.
+- **Version identification.** The driver calls `RtlGetVersion` and cross-checks
+  `KUSER_SHARED_DATA->NtBuildNumber` (the same value KDU reads through
+  `NtCurrentPeb()->OSBuildNumber`). A mismatch is logged and the shared-data build wins.
+  `info` reports the full major/minor/build and the decoded OS name.
+- **Offset table, ported from KDU.** `shared/PplBuilds.c` has one entry per exact NT build
+  from Windows 8.1 (9600) through Windows 11 25H2 (26200), derived from KDU's
+  `KDUGetEprocessOffsets` and `PsProtectionOffset_*` constants. `PS_PROTECTION` is
+  `0x87A` for 19041-22631 and `0x5FA` for 26100-26200, among others. The table also
+  records `MitigationFlags` and `ObjectTable` offsets for diagnostics; only
+  `PS_PROTECTION` is written. Unknown builds (including 26H1/26H2, which KDU does not
+  map yet) load but `SET`/`FILTER` return `STATUS_NOT_SUPPORTED`; the driver never
+  guesses or scans for the field.
 - **One byte.** Only `PS_PROTECTION` is written. The optional
   `SignatureLevel`/`SectionSignatureLevel` diagnostics are reported as zero because those
   undocumented exports use an output-pointer ABI; the driver deliberately does not call
@@ -287,8 +306,10 @@ Default signer is `am` (Antimalware). Supported protection bytes include:
 
 ## Risks and limitations
 
-- **Build-specific offsets.** `0x5FA` is used for 26100/26200 and `0x87A` for
-  22000/22621/22631. An unknown build returns `STATUS_NOT_SUPPORTED`; do not guess.
+- **Build-specific offsets.** The table is ported from KDU and covers 9600-26200. A wrong
+  or missing entry is dangerous, so an unknown build returns `STATUS_NOT_SUPPORTED`; do
+  not guess. Add new builds to `shared/PplBuilds.c` only after confirming the offset
+  (for example with the matching type information from Vergilius Project).
 - **DKOM is unsupported.** Microsoft does not support direct `EPROCESS` modification.
 - **PPL is not kernel protection.** Kernel code can still manipulate the process.
 - **Existing handles are not revoked.** If another process already has a full-access
@@ -332,7 +353,8 @@ Default signer is `am` (Antimalware). Supported protection bytes include:
 - `PsSetCreateProcessNotifyRoutineEx failed: 0xC0000022` - the driver image lacks
   `/INTEGRITYCHECK`; check `dumpbin /headers` for "Check integrity".
 - `filter add` returns `STATUS_NOT_SUPPORTED` - the OS build has no known offset, or the
-  callback is not registered.
+  callback is not registered. Run `pplctl builds` to see whether the running build is in
+  the table.
 - No `[PplExecutor]` messages - attach DebugView with kernel capture or use WinDbg.
 
 ## Cleanup

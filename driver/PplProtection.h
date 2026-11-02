@@ -2,6 +2,7 @@
 
 #include <ntddk.h>
 #include "../shared/PplIoctl.h"
+#include "../shared/PplBuilds.h"
 
 //
 // Declared in ntifs.h, which cannot be mixed with wdmsec.h in this driver.
@@ -12,9 +13,12 @@ PsLookupProcessByProcessId(
     _In_ HANDLE ProcessId,
     _Outptr_ PEPROCESS* Process);
 
+extern ULONG   g_PplMajorVersion;
+extern ULONG   g_PplMinorVersion;
 extern ULONG   g_PplBuildNumber;
 extern ULONG   g_PplProtectionOffset;
 extern BOOLEAN g_PplOffsetSupported;
+extern PPL_BUILD_OFFSETS g_PplOffsets;
 
 NTSTATUS PplProtectionInitialize(VOID);
 
