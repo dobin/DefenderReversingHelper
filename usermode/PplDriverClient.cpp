@@ -24,7 +24,7 @@ PplOpenDevice(
                       L"Could not open %s: error %lu (%s)\n",
                       PPL_WIN32_DEVICE, error,
                       error == ERROR_ACCESS_DENIED
-                          ? L"run this command from an elevated console"
+                          ? L"access denied by the driver device DACL"
                           : error == ERROR_FILE_NOT_FOUND
                                 ? L"is the PplExecutor driver loaded?"
                                 : L"unknown error");
@@ -68,7 +68,7 @@ PplIoctl(
                       static_cast<unsigned long>(IoctlCode),
                       error,
                       error == ERROR_ACCESS_DENIED
-                          ? L" (access denied; run elevated)"
+                          ? L" (access denied by the driver device DACL)"
                           : L"");
     }
 

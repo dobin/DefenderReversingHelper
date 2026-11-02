@@ -29,7 +29,11 @@ PplpCreateControlDevice(
 
     RtlInitUnicodeString(&deviceName, PPL_DEVICE_NAME);
     RtlInitUnicodeString(&symbolicLinkName, PPL_SYMLINK_NAME);
-    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    //
+    // Test tool: allow any local user to issue IOCTLs. Loading/unloading the
+    // driver still requires an administrator.
+    //
+    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;WD)");
 
     status = IoCreateDeviceSecure(
         DriverObject,

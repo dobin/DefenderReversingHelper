@@ -38,14 +38,16 @@ PrintUsage()
         L"  pplctl filter remove --name <pattern>\n"
         L"  pplctl filter clear\n"
         L"  pplctl filter list\n"
-        L"  pplctl broker  [--pipe PplGrant] [--signer am] [--audit] [--once] [--allow-all]\n"
+        L"  pplctl broker  [--pipe PplGrant] [--signer am] [--audit] [--once] [--admin-only]\n"
         L"  pplctl connect [--pipe PplGrant] [--hold <seconds>]\n"
         L"  pplctl builds\n"
         L"  pplctl version\n"
         L"\n"
         L"Default signer is antimalware (PPL-Antimalware, protection byte 0x31).\n"
-        L"All driver commands require an elevated console.\n"
-        L"--allow-all exposes an Everyone-writable PPL grant pipe and is for an isolated test VM only.\n");
+        L"Driver installation/removal requires an elevated console; pplctl commands work for any local user.\n"
+        L"The control device is writable by all local users, so any local process can grant or clear PPL.\n"
+        L"Broker defaults to an Everyone-writable PPL grant pipe (--allow-all); use it only in an isolated test VM.\n"
+        L"--admin-only restricts the pipe to SYSTEM and Administrators instead.\n");
 }
 
 bool
@@ -877,12 +879,12 @@ CommandBroker(int argc, wchar_t** argv)
     UCHAR signer = PS_PROTECTED_SIGNER_ANTIMALWARE;
     bool audit = false;
     bool once = false;
-    bool allowAll = false;
+    bool adminOnly = false;
     HANDLE device;
     PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
     SECURITY_ATTRIBUTES securityAttributes = {};
     const wchar_t* sddl =
-        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+        L"D:P(A;;GA;;;WD)";
 
     for (int i = 2; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--pipe") == 0 && i + 1 < argc) {
@@ -897,15 +899,17 @@ CommandBroker(int argc, wchar_t** argv)
         } else if (_wcsicmp(argv[i], L"--once") == 0) {
             once = true;
         } else if (_wcsicmp(argv[i], L"--allow-all") == 0) {
-            allowAll = true;
+            adminOnly = false;
+        } else if (_wcsicmp(argv[i], L"--admin-only") == 0) {
+            adminOnly = true;
         } else {
             std::fwprintf(stderr, L"Unknown option '%s'.\n", argv[i]);
             return 2;
         }
     }
 
-    if (allowAll) {
-        sddl = L"D:P(A;;GA;;;WD)";
+    if (adminOnly) {
+        sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
     }
 
     device = PplOpenDevice();
@@ -929,9 +933,9 @@ CommandBroker(int argc, wchar_t** argv)
     std::wprintf(L"broker pid=%lu pipe=%s signer=%s type=ppl\n",
                  GetCurrentProcessId(), pipePath.c_str(),
                  PplSignerName(signer));
-    if (allowAll) {
-        std::wprintf(L"WARNING: --allow-all grants PPL to every local process that connects.\n"
-                     L"         Use only in an isolated test VM.\n");
+    if (!adminOnly) {
+        std::wprintf(L"WARNING: the default pipe DACL grants PPL to every local process that connects.\n"
+                     L"         Use only in an isolated test VM, or restart with --admin-only.\n");
     }
     std::wprintf(L"Waiting for clients...\n");
 

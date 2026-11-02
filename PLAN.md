@@ -11,7 +11,7 @@ Three user-facing interfaces:
 1. **Specific PID** — `pplctl set --pid <pid> [--signer am|wintcb|...]`
 2. **Process-name filter** — `pplctl filter add --name test_`; a kernel process-creation
    callback applies PPL automatically to every new matching process.
-3. **On-connect** — a small admin-owned named-pipe broker; a process connects to
+3. **On-connect** — a small user-mode named-pipe broker; a process connects to
    `\\.\pipe\PplGrant`, the broker resolves its PID with
    `GetNamedPipeClientProcessId`, and grants PPL through the driver.
 
@@ -51,8 +51,8 @@ Prerequisites:
 1. Install the **Windows Driver Kit (WDK)** for SDK 10.0.26100 via Visual Studio Installer.
    Verify `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km` exists and the
    `WindowsKernelModeDriver10.0` toolset is available.
-2. Use an elevated shell for cert installation, test-signing changes, driver install, and
-   all driver/CLI tests.
+2. Use an elevated shell for cert installation, test-signing changes, and driver
+   install/removal. After the driver is loaded, CLI commands can run as a normal user.
 3. Work in a **test VM**. Take a snapshot before first driver load. A bad DKOM write can
    bugcheck the machine.
 
@@ -220,7 +220,8 @@ typedef struct _PPL_DRIVER_INFO {
 } PPL_DRIVER_INFO;
 ```
 
-IOCTLs (`METHOD_BUFFERED`, `FILE_ANY_ACCESS`; security comes from the device DACL):
+IOCTLs (`METHOD_BUFFERED`, `FILE_ANY_ACCESS`; the device DACL allows all local users in
+this test tool):
 
 | IOCTL | Input | Output |
 |---|---|---|
@@ -242,8 +243,9 @@ Convention: malformed buffers return `STATUS_INVALID_PARAMETER` /
 
 ### 5.1 DriverEntry / unload
 
-- Create a control device with `IoCreateDeviceSecure` using an admin/SYSTEM-only DACL:
-  `L"D:P(A;;GA;;;SY)(A;;GA;;;BA)"` and `FILE_DEVICE_SECURE_OPEN`. Link `Wdmsec.lib`.
+- Create a control device with `IoCreateDeviceSecure` using an Everyone DACL:
+  `L"D:P(A;;GA;;;WD)"` and `FILE_DEVICE_SECURE_OPEN`. This lets non-admin processes use
+  `pplctl` after an administrator has loaded the driver. Link `Wdmsec.lib`.
 - Create symlink `\??\PplExecutor`.
 - Clear `DO_DEVICE_INITIALIZING`.
 - Register `PsSetCreateProcessNotifyRoutineEx(PplCreateProcessNotifyEx, FALSE)`.
@@ -459,7 +461,7 @@ pplctl filter add    --name <pattern> [--signer am|wintcb|...] [--audit] [--exac
 pplctl filter remove --name <pattern>
 pplctl filter clear
 pplctl filter list
-pplctl broker  [--pipe PplGrant] [--signer am] [--once] [--allow-all]
+pplctl broker  [--pipe PplGrant] [--signer am] [--once] [--admin-only]
 pplctl connect [--pipe PplGrant] [--hold <seconds>]
 pplctl version
 ```
@@ -485,9 +487,10 @@ pplctl version
 - `pplctl broker` creates `\\.\pipe\PplGrant` with `PIPE_ACCESS_DUPLEX`,
   `PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT`,
   `PIPE_UNLIMITED_INSTANCES`.
-- Default pipe DACL: admin/SYSTEM only
-  (`D:P(A;;GA;;;SY)(A;;GA;;;BA)`). `--allow-all` uses `D:P(A;;GA;;;WD)` (Everyone);
-  this is a test-VM-only option and must be documented as dangerous.
+- Default pipe DACL: Everyone (`D:P(A;;GA;;;WD)`, the old `--allow-all` behavior);
+  this is a test-VM-only privilege boundary and must be documented as dangerous.
+  `--admin-only` restores the admin/SYSTEM-only DACL
+  (`D:P(A;;GA;;;SY)(A;;GA;;;BA)`). This affects the pipe only, not the control device.
 - Loop:
   1. `ConnectNamedPipe`; treat `ERROR_PIPE_CONNECTED` as success (client connected
      before the call).
@@ -500,8 +503,8 @@ pplctl version
   6. `DisconnectNamedPipe`, close the instance, repeat (unless `--once`).
 - The driver also enforces the blocklist, so a malicious client cannot bypass it by
   connecting to the pipe.
-- This is a deliberate privilege-escalation endpoint on the test VM. Keep the pipe
-  admin-only unless the test specifically needs otherwise.
+- This is a deliberate privilege-escalation endpoint on the test VM. Use `--admin-only`
+  when the test does not specifically need unprivileged clients.
 
 ### 6.3 Driver client helper
 
@@ -638,9 +641,9 @@ does not delay unload. `sc stop` calls `DriverUnload`, which restores tracked pr
 | 6 | Filter add | `pplctl filter add --name test_`; start a new `test_target.exe`; it is protected automatically; a non-matching process is not |
 | 7 | Apply existing | With `test_target.exe` already running, `filter add --name test_ --apply-existing`; it becomes protected |
 | 8 | Filter clear | `filter clear` stops future grants; already-protected processes remain until `clear --pid` or driver unload |
-| 9 | On-connect | `pplctl broker --signer am` in one elevated console; `pplctl connect --hold 60` in another elevated console (or run the broker with `--allow-all` for a non-admin client); broker/client report `OK`; `probe` from a third elevated console denies access |
+| 9 | On-connect | `pplctl broker --signer am` in one console; `pplctl connect --hold 60` in another console (no elevation required by default); broker/client report `OK`; `probe` denies access |
 | 10 | Unload restore | `pplctl set` a target, then `sc stop PplExecutor`; target's protection returns to its original value (usually `0x00`) |
-| 11 | Negative tests | PID 0/4 refused; critical names refused; empty/short pattern refused; 17th filter refused; non-admin `pplctl` cannot open the device; broker cannot grant without admin |
+| 11 | Negative tests | PID 0/4 refused; critical names refused; empty/short pattern refused; 17th filter refused; non-admin `pplctl` can open the device and grant/clear PPL |
 | 12 | Stability | Create/exit many matching processes; no bugcheck, no stuck process; reboot clears all PPL state |
 
 Debugging aids:
@@ -668,8 +671,11 @@ Debugging aids:
   process. Default to PPL-Antimalware and keep a second admin console available.
 - **Tracking is best-effort.** Normal `clear`/driver unload restores tracked processes.
   A driver crash or forced unload can leave processes PPL until reboot.
-- **Broker is a privilege boundary.** Default pipe DACL is admin/SYSTEM only.
-  `--allow-all` lets any local process become PPL; use only in an isolated test VM.
+- **Control device is a privilege boundary.** Its DACL allows all local users, so any
+  local process can grant or clear PPL on any non-blocklisted process.
+- **Broker is a privilege boundary.** Default pipe DACL is Everyone (old `--allow-all`);
+  any local process can become PPL. `--admin-only` restricts the pipe. Use only in an
+  isolated test VM.
 - **Test signing weakens the machine.** Turn it off and remove the test cert when done.
   Do not run this on a production host.
 - **`/INTEGRITYCHECK` is mandatory.** Without it, `PsSetCreateProcessNotifyRoutineEx`
