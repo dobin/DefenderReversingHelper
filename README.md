@@ -10,8 +10,8 @@ The purpose is to enable AI agents to start tools as PPL.
 > non-blocklisted processes; the optional broker also allows everyone by default.
 > Never use on a production host.
 
-Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/KDU. 
-
+Vibe coded by Deepseek V4.1 Flash. With input from [KDU](https://github.com/hfiref0x/KDU). 
+Similar to [PPLRunner](https://github.com/pathtofile/PPLRunner) but easier to use. 
 
 ## Requirements
 
