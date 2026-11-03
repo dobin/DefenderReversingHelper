@@ -65,4 +65,3 @@ For name filters, the on-connect broker, other signers, and all CLI options, see
 
 [Detailed guide](GUIDE.md): full setup, commands, architecture, risks, tests, and troubleshooting.
 
-Vibe coded by Deepseek V4.1 Flash, with input from [KDU](https://github.com/hfiref0x/KDU).
