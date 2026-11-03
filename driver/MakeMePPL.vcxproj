@@ -13,8 +13,8 @@
 
   <PropertyGroup Label="Globals">
     <ProjectGuid>{1344DF5D-5F05-4F79-84CA-EEADA7B49E30}</ProjectGuid>
-    <RootNamespace>PplExecutor</RootNamespace>
-    <ProjectName>PplExecutor</ProjectName>
+    <RootNamespace>MakeMePPL</RootNamespace>
+    <ProjectName>MakeMePPL</ProjectName>
     <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
     <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
   </PropertyGroup>
@@ -61,7 +61,7 @@
   <PropertyGroup>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Configuration)\</IntDir>
-    <TargetName>PplExecutor</TargetName>
+    <TargetName>MakeMePPL</TargetName>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -81,7 +81,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="PplExecutor.c" />
+    <ClCompile Include="MakeMePPL.c" />
     <ClCompile Include="PplFilter.c" />
     <ClCompile Include="PplProtection.c" />
     <ClCompile Include="..\shared\PplBuilds.c" />

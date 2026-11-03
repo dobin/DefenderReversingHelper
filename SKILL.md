@@ -1,6 +1,6 @@
 ---
 name: ppl-executor
-description: "Use when testing software as Windows Protected Process Light (PPL) with PplExecutor and pplctl: grant by PID, image-name filter, or a target connecting to the PplGrant broker. Requires an already-loaded driver; verify readiness, protection, and cleanup."
+description: "Use when testing software as Windows Protected Process Light (PPL) with MakeMePPL and pplctl: grant by PID, image-name filter, or a target connecting to the PplGrant broker. Requires an already-loaded driver; verify readiness, protection, and cleanup."
 ---
 
 # PPL software testing

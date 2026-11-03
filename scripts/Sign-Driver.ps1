@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
 if (-not $DriverPath) {
-    $DriverPath = Join-Path $Root "bin\$Configuration\PplExecutor.sys"
+    $DriverPath = Join-Path $Root "bin\$Configuration\MakeMePPL.sys"
 }
 if (-not $PfxPath) {
     $PfxPath = Join-Path $Root 'certs\ppl_test.pfx'

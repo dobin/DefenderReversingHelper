@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ServiceName = 'PplExecutor'
+    [string]$ServiceName = 'MakeMePPL'
 )
 
 $ErrorActionPreference = 'Stop'

@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
-$Solution = Join-Path $Root 'PplExecutor.sln'
+$Solution = Join-Path $Root 'MakeMePPL.sln'
 
 function Find-MSBuild {
     $candidates = @()

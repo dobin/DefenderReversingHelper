@@ -26,7 +26,7 @@ void
 PrintUsage()
 {
     std::wprintf(
-        L"PplExecutor control tool\n"
+        L"MakeMePPL control tool\n"
         L"\n"
         L"Usage:\n"
         L"  pplctl info\n"
@@ -1205,7 +1205,7 @@ wmain(
     if (_wcsicmp(argv[1], L"version") == 0) {
         ULONG build = QueryCurrentBuild();
 
-        std::wprintf(L"PplExecutor %s\n", PPL_DRIVER_VERSION);
+        std::wprintf(L"MakeMePPL %s\n", PPL_DRIVER_VERSION);
         if (build != 0) {
             std::wprintf(L"OS: %s (build %lu)\n",
                          PplBuildDisplayName(build),

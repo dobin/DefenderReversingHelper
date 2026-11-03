@@ -26,7 +26,7 @@ PplOpenDevice(
                       error == ERROR_ACCESS_DENIED
                           ? L"access denied by the driver device DACL"
                           : error == ERROR_FILE_NOT_FOUND
-                                ? L"is the PplExecutor driver loaded?"
+                                ? L"is the MakeMePPL driver loaded?"
                                 : L"unknown error");
     }
 

@@ -1,4 +1,4 @@
-# PplExecutor — Windows 11 PPL Flag Driver
+# MakeMePPL — Windows 11 PPL Flag Driver
 
 ## 0. Goal
 
@@ -60,15 +60,15 @@ Prerequisites:
 
 ```text
 ppl_executor/
-  PplExecutor.sln
+  MakeMePPL.sln
   PLAN.md
   README.md                     # written after implementation
   shared/
     PplIoctl.h                  # IOCTLs + structs shared by driver and CLI
     PplBuilds.c/.h              # NT builds + EPROCESS offsets (ported from KDU)
   driver/
-    PplExecutor.vcxproj
-    PplExecutor.c               # DriverEntry, unload, device, IRP dispatch
+    MakeMePPL.vcxproj
+    MakeMePPL.c               # DriverEntry, unload, device, IRP dispatch
     PplProtection.c/.h          # offset table, PS_PROTECTION read/write/verify, tracking
     PplFilter.c/.h              # name filters, process-creation callback, apply-existing
     PplLog.h                    # DbgPrintEx wrapper
@@ -91,10 +91,10 @@ ppl_executor/
 ## 3. Architecture
 
 ```text
-pplctl set/filter/query ──DeviceIoControl──> \\.\PplExecutor
+pplctl set/filter/query ──DeviceIoControl──> \\.\MakeMePPL
                                                │
                                      ┌─────────┴──────────┐
-                                     │ PplExecutor.sys     │
+                                     │ MakeMePPL.sys     │
                                      │  - IOCTL dispatch   │
                                      │  - EPROCESS DKOM    │
                                      │  - process callback │
@@ -121,9 +121,9 @@ No kernel pipe, no network socket, no service installation is required for the f
 Device names:
 
 ```c
-#define PPL_DEVICE_NAME      L"\\Device\\PplExecutor"
-#define PPL_SYMLINK_NAME     L"\\??\\PplExecutor"
-#define PPL_WIN32_DEVICE     L"\\\\.\\PplExecutor"
+#define PPL_DEVICE_NAME      L"\\Device\\MakeMePPL"
+#define PPL_SYMLINK_NAME     L"\\??\\MakeMePPL"
+#define PPL_WIN32_DEVICE     L"\\\\.\\MakeMePPL"
 #define PPL_DEFAULT_PIPE     L"PplGrant"
 ```
 
@@ -246,7 +246,7 @@ Convention: malformed buffers return `STATUS_INVALID_PARAMETER` /
 - Create a control device with `IoCreateDeviceSecure` using an Everyone DACL:
   `L"D:P(A;;GA;;;WD)"` and `FILE_DEVICE_SECURE_OPEN`. This lets non-admin processes use
   `pplctl` after an administrator has loaded the driver. Link `Wdmsec.lib`.
-- Create symlink `\??\PplExecutor`.
+- Create symlink `\??\MakeMePPL`.
 - Clear `DO_DEVICE_INITIALIZING`.
 - Register `PsSetCreateProcessNotifyRoutineEx(PplCreateProcessNotifyEx, FALSE)`.
   If it fails with `STATUS_ACCESS_DENIED`, log the likely cause: the driver image lacks
@@ -441,7 +441,7 @@ PPL-Antimalware.
 ```c
 #define PPL_LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, \
-               "[PplExecutor] " fmt "\n", __VA_ARGS__)
+               "[MakeMePPL] " fmt "\n", __VA_ARGS__)
 ```
 
 Use DebugView with kernel capture, or WinDbg. Log offset/build, PID, image name, old/new
@@ -521,7 +521,7 @@ pplctl version
 
 ### 7.1 WDK project settings
 
-`driver/PplExecutor.vcxproj`:
+`driver/MakeMePPL.vcxproj`:
 
 - `ConfigurationType = Driver`
 - `DriverType = WDM` (no KMDF dependency/co-installer)
@@ -555,7 +555,7 @@ Build:
 
 ```powershell
 & "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
-  .\PplExecutor.sln /m /p:Configuration=Release /p:Platform=x64
+  .\MakeMePPL.sln /m /p:Configuration=Release /p:Platform=x64
 ```
 
 `scripts/Build.ps1` wraps this and fails with a clear message if the WDK is missing.
@@ -566,7 +566,7 @@ Build:
 
 ```powershell
 $cert = New-SelfSignedCertificate -Type CodeSigningCert `
-  -Subject "CN=PplExecutor Test" -CertStoreLocation Cert:\CurrentUser\My `
+  -Subject "CN=MakeMePPL Test" -CertStoreLocation Cert:\CurrentUser\My `
   -HashAlgorithm SHA256 -KeyLength 2048 -NotAfter (Get-Date).AddYears(3) `
   -TextExtension @("2.5.29.37={text}1.3.6.1.4.1.311.61.4.1,1.3.6.1.5.5.7.3.3")
 
@@ -587,9 +587,9 @@ Sign and verify:
 ```powershell
 & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" `
   sign /fd SHA256 /f certs\ppl_test.pfx /p $password /ph /v `
-  bin\Release\PplExecutor.sys
+  bin\Release\MakeMePPL.sys
 
-& "...\signtool.exe" verify /v /pa bin\Release\PplExecutor.sys
+& "...\signtool.exe" verify /v /pa bin\Release\MakeMePPL.sys
 ```
 
 ### 7.3 Enable test signing
@@ -611,19 +611,19 @@ Reboot. Verify with `bcdedit /enum {current}` (expect `testsigning Yes`) and
 `scripts/Install-Driver.ps1`:
 
 ```powershell
-sc.exe stop PplExecutor           # ignore "not started"
-sc.exe delete PplExecutor         # ignore "not found"
-sc.exe create PplExecutor type= kernel start= demand error= normal `
-  binPath= "C:\Data\defender-2026-autumn\ppl_executor\bin\Release\PplExecutor.sys"
-sc.exe start PplExecutor
-sc.exe query PplExecutor
+sc.exe stop MakeMePPL           # ignore "not started"
+sc.exe delete MakeMePPL         # ignore "not found"
+sc.exe create MakeMePPL type= kernel start= demand error= normal `
+  binPath= "C:\Data\defender-2026-autumn\ppl_executor\bin\Release\MakeMePPL.sys"
+sc.exe start MakeMePPL
+sc.exe query MakeMePPL
 ```
 
 Uninstall:
 
 ```powershell
-sc.exe stop PplExecutor
-sc.exe delete PplExecutor
+sc.exe stop MakeMePPL
+sc.exe delete MakeMePPL
 ```
 
 Close `pplctl`/broker windows before stopping the driver so the control device handle
@@ -633,23 +633,23 @@ does not delay unload. `sc stop` calls `DriverUnload`, which restores tracked pr
 
 | # | Test | Expected |
 |---|---|---|
-| 1 | Build solution | Driver + CLI + test target build; `dumpbin /headers PplExecutor.sys` shows "Force Integrity" |
+| 1 | Build solution | Driver + CLI + test target build; `dumpbin /headers MakeMePPL.sys` shows "Force Integrity" |
 | 2 | Sign + verify | `signtool verify /pa` succeeds |
-| 3 | Test signing + load | `sc start PplExecutor` succeeds; `pplctl info` reports build 26100, offset `0x5FA` |
+| 3 | Test signing + load | `sc start MakeMePPL` succeeds; `pplctl info` reports build 26100, offset `0x5FA` |
 | 4 | PID set | Start `test_target.exe`; `pplctl set --pid <pid>`; `query` shows `Protection=0x31`; `probe` denies all-access/VM-read but allows limited-info |
 | 5 | PID clear | `pplctl clear --pid <pid>` restores `0x00`; `probe` allows all-access |
 | 6 | Filter add | `pplctl filter add --name test_`; start a new `test_target.exe`; it is protected automatically; a non-matching process is not |
 | 7 | Apply existing | With `test_target.exe` already running, `filter add --name test_ --apply-existing`; it becomes protected |
 | 8 | Filter clear | `filter clear` stops future grants; already-protected processes remain until `clear --pid` or driver unload |
 | 9 | On-connect | `pplctl broker --signer am` in one console; `pplctl connect --hold 60` in another console (no elevation required by default); broker/client report `OK`; `probe` denies access |
-| 10 | Unload restore | `pplctl set` a target, then `sc stop PplExecutor`; target's protection returns to its original value (usually `0x00`) |
+| 10 | Unload restore | `pplctl set` a target, then `sc stop MakeMePPL`; target's protection returns to its original value (usually `0x00`) |
 | 11 | Negative tests | PID 0/4 refused; critical names refused; empty/short pattern refused; 17th filter refused; non-admin `pplctl` can open the device and grant/clear PPL |
 | 12 | Stability | Create/exit many matching processes; no bugcheck, no stuck process; reboot clears all PPL state |
 
 Debugging aids:
 
-- DebugView (kernel capture) for `[PplExecutor]` lines.
-- `sc.exe query PplExecutor` for load state.
+- DebugView (kernel capture) for `[MakeMePPL]` lines.
+- `sc.exe query MakeMePPL` for load state.
 - `Get-WinEvent -LogName System` for driver load errors.
 - WinDbg + VM snapshot if the driver bugchecks.
 
@@ -688,7 +688,7 @@ Debugging aids:
 1. **Scaffold:** solution, shared header, empty driver + CLI, WDK project settings,
    `/INTEGRITYCHECK`. Acceptance: both projects build; `dumpbin` shows Force Integrity.
 2. **Sign/load:** cert script, sign/verify, test-signing script, install/uninstall
-   scripts. Acceptance: an empty `PplExecutor.sys` loads and unloads on 26100.
+   scripts. Acceptance: an empty `MakeMePPL.sys` loads and unloads on 26100.
 3. **PID DKOM:** offset table, `SET/CLEAR/QUERY` IOCTLs, `PsIsProtectedProcess`
    verification, tracking. Acceptance: `set/clear/query/probe` on `test_target.exe`.
 4. **Name filter:** filter array, process-creation callback, apply-existing enumeration,

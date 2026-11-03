@@ -5,14 +5,14 @@ param(
 
     [string]$DriverPath,
 
-    [string]$ServiceName = 'PplExecutor'
+    [string]$ServiceName = 'MakeMePPL'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
 if (-not $DriverPath) {
-    $DriverPath = Join-Path $Root "bin\$Configuration\PplExecutor.sys"
+    $DriverPath = Join-Path $Root "bin\$Configuration\MakeMePPL.sys"
 }
 
 function Assert-Administrator {

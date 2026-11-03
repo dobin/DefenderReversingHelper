@@ -1,7 +1,7 @@
 #pragma once
 
 //
-// Shared ABI between PplExecutor.sys and PplCtl.exe.
+// Shared ABI between MakeMePPL.sys and PplCtl.exe.
 //
 // This header deliberately has no kernel/user-mode includes. Include <ntddk.h>
 // in kernel code and <windows.h> + <winioctl.h> in user-mode code before this
@@ -14,9 +14,9 @@ typedef LONG NTSTATUS;
 #endif
 
 #define PPL_DRIVER_VERSION          L"1.1.0"
-#define PPL_DEVICE_NAME             L"\\Device\\PplExecutor"
-#define PPL_SYMLINK_NAME            L"\\??\\PplExecutor"
-#define PPL_WIN32_DEVICE            L"\\\\.\\PplExecutor"
+#define PPL_DEVICE_NAME             L"\\Device\\MakeMePPL"
+#define PPL_SYMLINK_NAME            L"\\??\\MakeMePPL"
+#define PPL_WIN32_DEVICE            L"\\\\.\\MakeMePPL"
 #define PPL_DEFAULT_PIPE            L"PplGrant"
 
 #define PPL_MAX_FILTERS             16

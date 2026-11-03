@@ -1,7 +1,9 @@
-﻿# PplExecutor
+﻿# MakeMePPL
 
 A test-signed Windows driver and CLI that grant **Protected Process Light (PPL)** to a
 process by PID, name filter, or named-pipe connection. Default: PPL-Antimalware (`0x31`).
+
+The purpose is to enable AI agents to start tools as PPL. 
 
 > **Isolated test VM only.** Unsupported kernel memory modification can crash Windows.
 > Take a snapshot first. The driver allows **any local user** to grant or clear PPL on

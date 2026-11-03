@@ -2,7 +2,7 @@
 param(
     [string]$PfxPassword = $env:PPL_TEST_PFX_PASSWORD,
 
-    [string]$Subject = 'CN=PplExecutor Test',
+    [string]$Subject = 'CN=MakeMePPL Test',
 
     [int]$Years = 3
 )

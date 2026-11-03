@@ -8,4 +8,4 @@
 //
 #define PPL_LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, \
-               "[PplExecutor] " fmt "\n", ##__VA_ARGS__)
+               "[MakeMePPL] " fmt "\n", ##__VA_ARGS__)

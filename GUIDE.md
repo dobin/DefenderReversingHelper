@@ -1,10 +1,10 @@
-# PplExecutor detailed guide
+# MakeMePPL detailed guide
 
 For the shortest setup path, see the [README](README.md). This guide contains the full
 setup instructions, command reference, design notes, risks, test matrix, troubleshooting,
 and cleanup details.
 
-PplExecutor is a test-signed Windows 11 x64 WDM driver plus a user-mode CLI that sets
+MakeMePPL is a test-signed Windows 11 x64 WDM driver plus a user-mode CLI that sets
 `EPROCESS!PS_PROTECTION` on a target process. The target becomes **Protected Process
 Light (PPL)** until the protection is cleared, the driver is unloaded, or the machine
 reboots.
@@ -41,12 +41,12 @@ can grant or clear PPL on any non-blocklisted process.
 
 ```text
 ppl_executor/
-  PplExecutor.sln
+  MakeMePPL.sln
   shared/PplIoctl.h             shared IOCTLs and structs
   shared/PplBuilds.c/.h         NT build numbers + EPROCESS offset table
   driver/
-    PplExecutor.vcxproj
-    PplExecutor.c               DriverEntry, control device, IOCTL dispatch
+    MakeMePPL.vcxproj
+    MakeMePPL.c               DriverEntry, control device, IOCTL dispatch
     PplProtection.c/.h          offset table, DKOM, verification, tracking
     PplFilter.c/.h              filters, process callback, blocklist
     PplLog.h                    DbgPrintEx wrapper
@@ -97,13 +97,13 @@ or directly:
 
 ```powershell
 & "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
-  .\PplExecutor.sln /m /p:Configuration=Release /p:Platform=x64
+  .\MakeMePPL.sln /m /p:Configuration=Release /p:Platform=x64
 ```
 
 Outputs:
 
 ```text
-bin\Release\PplExecutor.sys
+bin\Release\MakeMePPL.sys
 bin\Release\PplCtl.exe
 bin\Release\test_target.exe
 ```
@@ -111,7 +111,7 @@ bin\Release\test_target.exe
 The driver is linked with `/INTEGRITYCHECK` in both configurations. Verify it:
 
 ```powershell
-dumpbin /headers .\bin\Release\PplExecutor.sys | Select-String "Check integrity"
+dumpbin /headers .\bin\Release\MakeMePPL.sys | Select-String "Check integrity"
 ```
 
 That flag sets `IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY`, which
@@ -394,7 +394,7 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 |---|---|---|
 | 1 | Build | Driver, CLI, target build; `dumpbin` shows Check integrity |
 | 2 | Sign | `signtool verify /pa` succeeds |
-| 3 | Load | `sc start PplExecutor`; `pplctl info` shows 26100, `0x5FA` |
+| 3 | Load | `sc start MakeMePPL`; `pplctl info` shows 26100, `0x5FA` |
 | 4 | PID set | `set`, `query` shows `0x31`; `probe` denies all-access/VM-read |
 | 5 | PID clear | `clear` restores `0x00`; `probe` allows all-access |
 | 6 | Filter add | New `test_target.exe` is protected; non-match is not |
@@ -407,10 +407,10 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 
 ## Troubleshooting
 
-- `Could not open \\.\PplExecutor: error 5` - the device DACL denied access. Current
+- `Could not open \\.\MakeMePPL: error 5` - the device DACL denied access. Current
   builds allow all local users, so this usually means an older driver is loaded or the
   device DACL was customized. Rebuild/reinstall the driver.
-- `error 2` - the driver is not loaded. Check `sc.exe query PplExecutor`.
+- `error 2` - the driver is not loaded. Check `sc.exe query MakeMePPL`.
 - Driver fails to load - confirm test signing is on, Secure Boot is off, the signature
   verifies, and HVCI is disabled in the test VM.
 - `PsSetCreateProcessNotifyRoutineEx failed: 0xC0000022` - the driver image lacks
@@ -418,7 +418,7 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 - `filter add` returns `STATUS_NOT_SUPPORTED` - the OS build has no known offset, or the
   callback is not registered. Run `pplctl builds` to see whether the running build is in
   the table.
-- No `[PplExecutor]` messages - attach DebugView with kernel capture or use WinDbg.
+- No `[MakeMePPL]` messages - attach DebugView with kernel capture or use WinDbg.
 
 ## Cleanup
 
