@@ -1,8 +1,9 @@
-﻿# MakeMePPL
+﻿# DefenderReversingHelper
 
-A test-signed Windows driver and CLI that grant **Protected Process Light (PPL)** to a
-process by PID, name filter, or named-pipe connection. Default: PPL-Antimalware (`0x31`).
-It can also remove the **block non-Microsoft binaries** process mitigation, so a target can load unsigned or test-signed DLLs.
+A test-signed Windows driver and CLI that grant: 
+* **Protected Process Light (PPL)** to a process by PID, name filter, or named-pipe connection.
+* Remove the **block non-Microsoft binaries** process mitigation of processes
+* DLL inject into `MsMpEng.exe`
 
 It ships a DLL injector, `bin\Release\injector.exe`, with driver-backed
 `--ppl`, `--fix-handle`, and `--kernel-thread` options. Together they can load
@@ -18,6 +19,7 @@ The purpose is to enable AI agents to start tools as PPL.
 
 Vibe coded by Deepseek V4.1 Flash. With input from [KDU](https://github.com/hfiref0x/KDU). 
 Similar to [PPLRunner](https://github.com/pathtofile/PPLRunner) but easier to use. 
+Based on the initial [MakeMePPL](https://github.com/dobin/MakeMePPL) tool. 
 
 ## Requirements
 
