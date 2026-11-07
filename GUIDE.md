@@ -22,6 +22,9 @@ Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/K
 ## Features
 
 - **PID:** `pplctl set --pid <pid>` / `clear` / `query` / `probe`
+- **DLL signature mitigation:** `pplctl allow-dlls --pid <pid>` removes the
+  `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` / Cobalt Strike `blockdll` restriction so the
+  target can load unsigned DLLs
 - **Name filter:** a process-creation callback protects every new image whose base name
   matches a pattern (protection is applied by a deferred driver thread shortly after
   creation); `--apply-existing` handles already-running processes
@@ -47,7 +50,9 @@ ppl_executor/
   driver/
     MakeMePPL.vcxproj
     MakeMePPL.c               DriverEntry, control device, IOCTL dispatch
-    PplProtection.c/.h          offset table, DKOM, verification, tracking
+    PplProtection.c/.h          PPL byte: set/clear/query, verification
+    PplMitigation.c/.h          DLL signature mitigation: allow-dlls, restore
+    PplTrack.c/.h               shared change-tracking table and lock
     PplFilter.c/.h              filters, process callback, blocklist
     PplLog.h                    DbgPrintEx wrapper
   usermode/
@@ -189,7 +194,18 @@ elevated if you want it to enable `SeDebugPrivilege`.
 
 # Restore the tracked original byte
 .\bin\Release\PplCtl.exe clear --pid <pid>
+
+# Remove the block-non-Microsoft-binaries mitigation (blockdll)
+.\bin\Release\PplCtl.exe allow-dlls --pid <pid>
 ```
+
+`allow-dlls` clears `EPROCESS!MitigationFlags` bit 23 (`SignatureMitigationOptIn`) and
+zeroes `EPROCESS!SectionSignatureLevel`, the DLL signature requirement. The change is
+tracked, so `clear --pid` and driver unload restore the original values. It works on
+processes created with `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` /
+`PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` and on
+processes that enabled `SetProcessMitigationPolicy(ProcessSignaturePolicy,
+MicrosoftSignedOnly=1)` at runtime.
 
 Protect every new `test_` image automatically:
 
@@ -274,6 +290,7 @@ pplctl set   --pid <pid> [--signer am|wintcb|windows|lsa|authenticode|codegen|wi
 pplctl clear --pid <pid>
 pplctl query --pid <pid>
 pplctl probe --pid <pid>
+pplctl allow-dlls --pid <pid>
 pplctl filter add    --name <pattern> [--signer <name>] [--audit] [--exact] [--apply-existing]
 pplctl filter remove --name <pattern>
 pplctl filter clear
@@ -305,6 +322,11 @@ Default signer is `am` (Antimalware). Supported protection bytes include:
 the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 `GetProcessInformation(ProcessProtectionLevelInfo)` to show the user-mode view.
 
+`query` also reports `SignatureLevel`, `SectionSignatureLevel`, the raw
+`MitigationFlags1`/`MitigationFlags2`, and `block non-MS DLLs: ON/off`.
+`allow-dlls` should change that line to `off`; `Get-ProcessMitigation` reports
+`MicrosoftSignedOnly: OFF` after the change.
+
 `probe` enables `SeDebugPrivilege` first, then tests:
 
 1. `PROCESS_ALL_ACCESS` (expected denied for PPL)
@@ -321,29 +343,36 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   from Windows 8.1 (9600) through Windows 11 25H2 (26200), derived from KDU's
   `KDUGetEprocessOffsets` and `PsProtectionOffset_*` constants. `PS_PROTECTION` is
   `0x87A` for 19041-22631 and `0x5FA` for 26100-26200, among others. The table also
-  records `MitigationFlags` and `ObjectTable` offsets for diagnostics; only
-  `PS_PROTECTION` is written. Unknown builds (including 26H1/26H2, which KDU does not
-  map yet) load but `SET`/`FILTER` return `STATUS_NOT_SUPPORTED`; the driver never
-  guesses or scans for the field.
-- **One byte.** Only `PS_PROTECTION` is written. The optional
-  `SignatureLevel`/`SectionSignatureLevel` diagnostics are reported as zero because those
-  undocumented exports use an output-pointer ABI; the driver deliberately does not call
-  them.
-- **Verification.** The driver reads the byte back and checks
+  records `MitigationFlags` and `ObjectTable` offsets. `PS_PROTECTION` is used for PPL;
+  `MitigationFlags1` is used by `allow-dlls`. Unknown builds (including 26H1/26H2, which
+  KDU does not map yet) load but `SET`/`FILTER`/`ALLOW-DLLS` return
+  `STATUS_NOT_SUPPORTED`; the driver never guesses or scans for the field.
+- **Protection byte.** PPL is set by writing only `PS_PROTECTION`. The driver does not
+  change `SignatureLevel`/`SectionSignatureLevel` for a PPL grant.
+- **Block non-Microsoft binaries.** `PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON`
+  is not stored verbatim as a bit in `MitigationFlags2`. The kernel translates it into
+  `MitigationFlags` bit 23 (`SignatureMitigationOptIn`) and raises
+  `SectionSignatureLevel` to 8 (Microsoft). `allow-dlls` clears bit 23 and zeroes
+  `SectionSignatureLevel`; it leaves `SignatureLevel` (the process image's own signing
+  level) and `MitigationFlags2` alone. Both writes are verified.
+- **Verification.** For PPL the driver reads the byte back and checks
   `PsIsProtectedProcess`/`PsIsProtectedProcessLight` for type 0, 1, or 2. On a signer-only
   change the boolean checks cannot distinguish signers, so the byte readback is the limit
-  of the claim. A failed verification restores the old byte.
-- **Tracking.** A fixed 256-entry nonpaged table records PID, EPROCESS identity, applied
-  byte, and original byte. The whole read/write/verify/track sequence is serialized by a
-  push lock. If the table is full, protection is still applied but that process is not
-  restored on unload.
+  of the claim. A failed verification restores the old byte. For `allow-dlls`, both the
+  32-bit flags value and `SectionSignatureLevel` are read back; a mismatch restores both.
+- **Tracking.** A fixed 256-entry nonpaged table records PID, EPROCESS identity, the
+  applied/original protection byte, and the applied/original mitigation flags and signature
+  levels. The whole read/write/verify/track sequence is serialized by a push lock. If the
+  table is full, the change is still applied but that process is not restored on unload.
 - **Clear safety.** `clear` refuses to remove protection from an untracked process whose
   current byte is non-zero. This avoids accidentally stripping PPL from Defender, LSA, or
-  a process protected by a previous driver load.
-- **Restore.** On normal `clear` or unload, the original byte is written only if the
-  current byte still matches what this driver applied. PID-reused or externally changed
-  processes are skipped. A driver crash or forced unload can leave processes PPL until
-  reboot; reboot is the recovery path.
+  a process protected by a previous driver load. A mitigation-only entry (created by
+  `allow-dlls`) always has a non-zero change mask, so `clear` restores the mitigation and
+  leaves the protection byte untouched.
+- **Restore.** On normal `clear` or unload, the original values are written only if the
+  current values still match what this driver applied. PID-reused or externally changed
+  processes are skipped. A driver crash or forced unload can leave processes PPL (or with
+  the DLL restriction removed) until reboot; reboot is the recovery path.
 - **Filter callback.** The callback is allocation-free, does not wait on I/O, and never
   sets `CreationStatus`. It copies the matched filter and queues the PID for a driver
   system thread, which applies protection about 100 ms later. Applying PPL directly in
@@ -370,6 +399,10 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   (for example with the matching type information from Vergilius Project).
 - **DKOM is unsupported.** Microsoft does not support direct `EPROCESS` modification.
 - **PPL is not kernel protection.** Kernel code can still manipulate the process.
+- **`allow-dlls` weakens code integrity.** It removes the block-non-Microsoft-binaries
+  mitigation from the target, so any unsigned DLL can load. The change is tracked and
+  restored by `clear --pid` or driver unload, but a crash or forced unload leaves the
+  target permissive until it exits or the machine reboots. Use only on a test target.
 - **Existing handles are not revoked.** If another process already has a full-access
   handle when the target becomes PPL, that handle may remain usable. Applying protection
   in the creation callback is stronger than PID/on-connect because fewer handles exist.
@@ -404,6 +437,7 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 | 10 | Unload restore | `sc stop` restores the target's original byte |
 | 11 | Negatives | PID 0/4, critical names, short/empty patterns, 17th filter refused; non-admin CLI succeeds |
 | 12 | Stability | Many matching create/exit cycles; no bugcheck; reboot clears state |
+| 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
 
 ## Troubleshooting
 
@@ -418,6 +452,12 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 - `filter add` returns `STATUS_NOT_SUPPORTED` - the OS build has no known offset, or the
   callback is not registered. Run `pplctl builds` to see whether the running build is in
   the table.
+- `allow-dlls` returns `STATUS_NOT_SUPPORTED` - the running build has no
+  `MitigationFlags` offset in the table (for example 1607/1703). `pplctl info` shows
+  `mitigation : allow-dlls supported` or the unsupported message.
+- `allow-dlls` succeeds but a DLL still fails to load - the binary signature policy is
+  gone, but another mitigation (ACG, image-load policy, or the image itself) may still
+  block it. Check `Get-ProcessMitigation -Id <pid>`; `MicrosoftSignedOnly` should be OFF.
 - No `[MakeMePPL]` messages - attach DebugView with kernel capture or use WinDbg.
 
 ## Cleanup

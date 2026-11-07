@@ -31,9 +31,10 @@ PrintUsage()
         L"Usage:\n"
         L"  pplctl info\n"
         L"  pplctl set   --pid <pid> [--signer am|wintcb|windows|lsa|authenticode|codegen|winsystem|app] [--audit]\n"
-        L"  pplctl clear --pid <pid>\n"
+        L"  pplctl clear --pid <pid> [--force]\n"
         L"  pplctl query --pid <pid>\n"
         L"  pplctl probe --pid <pid>\n"
+        L"  pplctl allow-dlls --pid <pid>\n"
         L"  pplctl filter add    --name <pattern> [--signer <name>] [--audit] [--exact] [--apply-existing]\n"
         L"  pplctl filter remove --name <pattern>\n"
         L"  pplctl filter clear\n"
@@ -44,6 +45,10 @@ PrintUsage()
         L"  pplctl version\n"
         L"\n"
         L"Default signer is antimalware (PPL-Antimalware, protection byte 0x31).\n"
+        L"allow-dlls removes the block-non-Microsoft-binaries mitigation (Cobalt Strike blockdll,\n"
+        L"PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) so the target can load unsigned DLLs.\n"
+        L"clear --force removes PPL from a process this driver did not protect; the byte is\n"
+        L"tracked, so set+clear restores it. Use only in an isolated test VM.\n"
         L"Driver installation/removal requires an elevated console; pplctl commands work for any local user.\n"
         L"The control device is writable by all local users, so any local process can grant or clear PPL.\n"
         L"Broker defaults to an Everyone-writable PPL grant pipe (--allow-all); use it only in an isolated test VM.\n"
@@ -306,6 +311,10 @@ CommandInfo()
                  OffsetOrDash(info.MitigationFlags1Offset).c_str(),
                  OffsetOrDash(info.MitigationFlags2Offset).c_str(),
                  OffsetOrDash(info.ObjectTableOffset).c_str());
+    std::wprintf(L"mitigation    : %s\n",
+                 (info.Flags & PPL_INFO_FLAG_MITIGATION_SUPPORTED)
+                     ? L"allow-dlls supported"
+                     : L"allow-dlls unsupported on this build");
     std::wprintf(L"max filters   : %lu\n", info.MaxFilters);
     std::wprintf(L"notify callback: %s\n",
                  (info.Flags & PPL_INFO_FLAG_NOTIFY_REGISTERED)
@@ -369,6 +378,82 @@ CommandBuilds()
     }
 
     return currentSupported ? 0 : 1;
+}
+
+int
+AllowNonMicrosoftDlls(
+    _In_ ULONG ProcessId)
+{
+    PPL_MITIGATION_REQUEST request = {};
+    PPL_MITIGATION_RESULT result = {};
+    HANDLE device;
+    DWORD returned = 0;
+
+    request.ProcessId = ProcessId;
+
+    device = PplOpenDevice();
+    if (device == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+
+    BOOL ok = PplIoctl(device, IOCTL_PPL_ALLOW_NON_MS_DLLS,
+                       &request, sizeof(request),
+                       &result, sizeof(result), &returned);
+    CloseHandle(device);
+    if (!ok) {
+        return 1;
+    }
+
+    std::wprintf(L"allow-dlls pid %lu: %s (0x%08lX)\n",
+                 ProcessId,
+                 PplNtStatusText(result.Status).c_str(),
+                 static_cast<unsigned long>(result.Status));
+
+    if (PplNtSuccess(result.Status)) {
+        std::wprintf(L"  MitigationFlags1: 0x%08lX -> 0x%08lX%s\n",
+                     static_cast<unsigned long>(result.OldMitigationFlags1),
+                     static_cast<unsigned long>(result.NewMitigationFlags1),
+                     (result.OldMitigationFlags1 == result.NewMitigationFlags1)
+                         ? L" (already clear)"
+                         : L"");
+        std::wprintf(L"  MitigationFlags2: 0x%08lX -> 0x%08lX\n",
+                     static_cast<unsigned long>(result.OldMitigationFlags2),
+                     static_cast<unsigned long>(result.NewMitigationFlags2));
+        std::wprintf(L"  SectionSignatureLevel: 0x%02X -> 0x%02X\n",
+                     static_cast<unsigned>(result.OldSectionSignatureLevel),
+                     static_cast<unsigned>(result.NewSectionSignatureLevel));
+        std::wprintf(L"  SignatureLevel: 0x%02X (unchanged)\n",
+                     static_cast<unsigned>(result.NewSignatureLevel));
+    }
+
+    return PplNtSuccess(result.Status) ? 0 : 1;
+}
+
+int
+CommandAllowDlls(int argc, wchar_t** argv)
+{
+    ULONG processId = 0;
+    bool havePid = false;
+
+    for (int i = 2; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
+            havePid = ParseUlong(argv[++i], &processId);
+            if (!havePid) {
+                std::fwprintf(stderr, L"Invalid --pid value.\n");
+                return 2;
+            }
+        } else {
+            std::fwprintf(stderr, L"Unknown option '%s'.\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (!havePid) {
+        std::fwprintf(stderr, L"allow-dlls requires --pid <pid>.\n");
+        return 2;
+    }
+
+    return AllowNonMicrosoftDlls(processId);
 }
 
 int
@@ -445,6 +530,7 @@ CommandClear(int argc, wchar_t** argv)
 {
     ULONG processId = 0;
     bool havePid = false;
+    bool force = false;
     PPL_OPERATION_RESULT result = {};
     HANDLE device;
     DWORD returned = 0;
@@ -456,6 +542,8 @@ CommandClear(int argc, wchar_t** argv)
                 std::fwprintf(stderr, L"Invalid --pid value.\n");
                 return 2;
             }
+        } else if (_wcsicmp(argv[i], L"--force") == 0) {
+            force = true;
         } else {
             std::fwprintf(stderr, L"Unknown option '%s'.\n", argv[i]);
             return 2;
@@ -467,12 +555,18 @@ CommandClear(int argc, wchar_t** argv)
         return 2;
     }
 
+    if (force) {
+        std::wprintf(L"WARNING: --force removes PPL from a process this driver did not protect.\n");
+    }
+
     device = PplOpenDevice();
     if (device == INVALID_HANDLE_VALUE) {
         return 1;
     }
 
-    BOOL ok = PplIoctl(device, IOCTL_PPL_CLEAR_BY_PID,
+    BOOL ok = PplIoctl(device,
+                       force ? IOCTL_PPL_FORCE_CLEAR_BY_PID
+                             : IOCTL_PPL_CLEAR_BY_PID,
                        &processId, sizeof(processId),
                        &result, sizeof(result), &returned);
     CloseHandle(device);
@@ -577,10 +671,17 @@ CommandQuery(int argc, wchar_t** argv)
         std::wprintf(L"\n");
         std::wprintf(L"  signature level: 0x%02X\n", result.SignatureLevel);
         std::wprintf(L"  section level  : 0x%02X\n", result.SectionSignatureLevel);
+        std::wprintf(L"  mitigation     : mit1=0x%08lX mit2=0x%08lX\n",
+                     static_cast<unsigned long>(result.MitigationFlags1),
+                     static_cast<unsigned long>(result.MitigationFlags2));
+        std::wprintf(L"  block non-MS DLLs: %s\n",
+                     (result.Flags & PPL_QUERY_FLAG_BLOCK_NON_MS_DLLS)
+                         ? L"ON"
+                         : L"off");
         std::wprintf(L"  PsIsProtectedProcess     : %s\n",
-                     (result.Flags & 1) ? L"TRUE" : L"FALSE");
+                     (result.Flags & PPL_QUERY_FLAG_PROTECTED) ? L"TRUE" : L"FALSE");
         std::wprintf(L"  PsIsProtectedProcessLight: %s\n",
-                     (result.Flags & 2) ? L"TRUE" : L"FALSE");
+                     (result.Flags & PPL_QUERY_FLAG_PROTECTED_LIGHT) ? L"TRUE" : L"FALSE");
     }
 
     PrintUserModeProtection(processId);
@@ -1183,6 +1284,9 @@ wmain(
     }
     if (_wcsicmp(argv[1], L"clear") == 0) {
         return CommandClear(argc, argv);
+    }
+    if (_wcsicmp(argv[1], L"allow-dlls") == 0) {
+        return CommandAllowDlls(argc, argv);
     }
     if (_wcsicmp(argv[1], L"query") == 0) {
         return CommandQuery(argc, argv);

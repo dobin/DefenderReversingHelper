@@ -4,6 +4,7 @@
 #include "../shared/PplIoctl.h"
 #include "PplLog.h"
 #include "PplProtection.h"
+#include "PplMitigation.h"
 #include "PplFilter.h"
 
 static PDEVICE_OBJECT g_DeviceObject;
@@ -302,6 +303,9 @@ PplpDeviceControl(
                            : 0) |
                       (g_PplOffsetSupported
                            ? PPL_INFO_FLAG_OFFSET_SUPPORTED
+                           : 0) |
+                      (g_PplOffsets.PsMitigationFlags1Offset != 0
+                           ? PPL_INFO_FLAG_MITIGATION_SUPPORTED
                            : 0);
 
         for (j = 0;
@@ -314,6 +318,103 @@ PplpDeviceControl(
 
         status = STATUS_SUCCESS;
         information = sizeof(*info);
+        break;
+    }
+
+    case IOCTL_PPL_ALLOW_NON_MS_DLLS:
+    {
+        PPL_MITIGATION_REQUEST request;
+        PPL_MITIGATION_RESULT* result = (PPL_MITIGATION_RESULT*)systemBuffer;
+
+        if (inputLength < sizeof(request) || systemBuffer == NULL) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(*result)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&request, systemBuffer, sizeof(request));
+        RtlZeroMemory(systemBuffer, outputLength);
+
+        if (request.ProcessId == 0 || request.Reserved != 0) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        (VOID)PplAllowNonMicrosoftDllsByPid(request.ProcessId, result);
+        status = STATUS_SUCCESS;
+        information = sizeof(*result);
+        break;
+    }
+
+    case IOCTL_PPL_FORCE_CLEAR_BY_PID:
+    {
+        ULONG processId;
+        PPL_OPERATION_RESULT* result = (PPL_OPERATION_RESULT*)systemBuffer;
+
+        if (inputLength < sizeof(processId) || systemBuffer == NULL) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(*result)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&processId, systemBuffer, sizeof(processId));
+        RtlZeroMemory(systemBuffer, outputLength);
+
+        (VOID)PplForceClearByPid(processId, result);
+        status = STATUS_SUCCESS;
+        information = sizeof(*result);
+        break;
+    }
+
+    case IOCTL_PPL_FIX_HANDLE_ACCESS:
+    {
+        PPL_HANDLE_FIX_REQUEST request;
+        PPL_HANDLE_FIX_RESULT* result = (PPL_HANDLE_FIX_RESULT*)systemBuffer;
+
+        if (inputLength < sizeof(request) || systemBuffer == NULL) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(*result)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&request, systemBuffer, sizeof(request));
+        RtlZeroMemory(systemBuffer, outputLength);
+
+        (VOID)PplFixHandleAccess(&request, result);
+        status = STATUS_SUCCESS;
+        information = sizeof(*result);
+        break;
+    }
+
+    case IOCTL_PPL_CREATE_REMOTE_THREAD:
+    {
+        PPL_REMOTE_THREAD_REQUEST request;
+        PPL_REMOTE_THREAD_RESULT* result = (PPL_REMOTE_THREAD_RESULT*)systemBuffer;
+
+        if (inputLength < sizeof(request) || systemBuffer == NULL) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(*result)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&request, systemBuffer, sizeof(request));
+        RtlZeroMemory(systemBuffer, outputLength);
+
+        (VOID)PplCreateRemoteThread(&request, result);
+        status = STATUS_SUCCESS;
+        information = sizeof(*result);
         break;
     }
 

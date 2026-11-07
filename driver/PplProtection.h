@@ -32,9 +32,37 @@ NTSTATUS PplClearByPid(
     _In_ ULONG ProcessId,
     _Out_ PPPL_OPERATION_RESULT Result);
 
+//
+// Removes PPL from a process this driver did not protect. The current byte is
+// recorded as the original, so a subsequent set+clear can restore it. Only
+// used by the explicit `clear --force` path.
+//
+NTSTATUS PplForceClearByPid(
+    _In_ ULONG ProcessId,
+    _Out_ PPPL_OPERATION_RESULT Result);
+
 NTSTATUS PplQueryByPid(
     _In_ ULONG ProcessId,
     _Out_ PPPL_QUERY_RESULT Result);
+
+//
+// Restores granted access on an existing user-mode process handle whose
+// DesiredAccess was stripped by a third-party ObRegisterCallbacks routine
+// (for example Defender self-protection). The handle must belong to the
+// calling process and reference Request->ProcessId.
+//
+NTSTATUS PplFixHandleAccess(
+    _In_ const PPL_HANDLE_FIX_REQUEST* Request,
+    _Out_ PPPL_HANDLE_FIX_RESULT Result);
+
+//
+// Creates a user thread in Request->ProcessId from kernel mode, using the
+// caller's process handle. The kernel access mode skips the protected-process
+// user-mode check that NtCreateThreadEx applies.
+//
+NTSTATUS PplCreateRemoteThread(
+    _In_ const PPL_REMOTE_THREAD_REQUEST* Request,
+    _Out_ PPPL_REMOTE_THREAD_RESULT Result);
 
 //
 // Applies protection to an already-referenced EPROCESS. Used by the PID path,

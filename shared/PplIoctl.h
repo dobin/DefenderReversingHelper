@@ -13,7 +13,7 @@ typedef LONG NTSTATUS;
 #define PPL_USER_NTSTATUS_DEFINED
 #endif
 
-#define PPL_DRIVER_VERSION          L"1.1.0"
+#define PPL_DRIVER_VERSION          L"1.3.0"
 #define PPL_DEVICE_NAME             L"\\Device\\MakeMePPL"
 #define PPL_SYMLINK_NAME            L"\\??\\MakeMePPL"
 #define PPL_WIN32_DEVICE            L"\\\\.\\MakeMePPL"
@@ -48,8 +48,33 @@ typedef LONG NTSTATUS;
 
 #define PPL_FILTER_FLAG_APPLY_EXISTING  0x00000001
 
-#define PPL_INFO_FLAG_NOTIFY_REGISTERED 0x00000001
-#define PPL_INFO_FLAG_OFFSET_SUPPORTED  0x00000002
+#define PPL_INFO_FLAG_NOTIFY_REGISTERED     0x00000001
+#define PPL_INFO_FLAG_OFFSET_SUPPORTED      0x00000002
+#define PPL_INFO_FLAG_MITIGATION_SUPPORTED  0x00000004
+
+//
+// EPROCESS!MitigationFlags bit 23.
+//
+// This is the opt-in switch the kernel sets for
+// PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+// (PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) and for
+// SetProcessMitigationPolicy(ProcessSignaturePolicy, MicrosoftSignedOnly=1).
+// The actual DLL requirement is EPROCESS!SectionSignatureLevel, which the
+// kernel raises to 8 (Microsoft) for the ALWAYS_ON policy. Clearing this bit
+// and zeroing SectionSignatureLevel removes the restriction.
+//
+// The creation-policy bit (bit 44 of the 64-bit mitigation options) is not
+// stored verbatim in MitigationFlags2. MitigationFlags2 holds unrelated
+// mitigations and is not modified.
+//
+#define PPL_MITIGATION_FLAG_SIGNATURE_OPT_IN 0x00800000
+
+//
+// PPL_QUERY_RESULT.Flags bits.
+//
+#define PPL_QUERY_FLAG_PROTECTED            0x01
+#define PPL_QUERY_FLAG_PROTECTED_LIGHT      0x02
+#define PPL_QUERY_FLAG_BLOCK_NON_MS_DLLS    0x04
 
 #define PPL_IOCTL_BASE              0x800
 #define PPL_DEVICE_TYPE             FILE_DEVICE_UNKNOWN
@@ -70,6 +95,70 @@ typedef LONG NTSTATUS;
     CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PPL_GET_INFO \
     CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PPL_ALLOW_NON_MS_DLLS \
+    CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// Removes PPL from a process even when this driver did not apply it. The
+// removed byte is recorded as the process's original protection, so a later
+// set+clear restores it. This is destructive and only meant for an isolated
+// test VM where the target really has to be unprotected (for example, to test
+// DLL loading into a PPL system process).
+//
+#define IOCTL_PPL_FORCE_CLEAR_BY_PID \
+    CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// Restores access rights that a protection callback stripped from an existing
+// handle in the calling process. This is the KDUControlHandleAccess equivalent
+// (KDU -pho) and is only needed when a security product lowers DesiredAccess
+// at handle creation instead of refusing the open. The driver verifies that
+// the handle points at the requested process before writing the mask.
+//
+#define IOCTL_PPL_FIX_HANDLE_ACCESS \
+    CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// Creates a user thread in a target process from kernel mode. The kernel path
+// bypasses the user-mode PsTestProtectedProcessIncompatibility check that makes
+// NtCreateThreadEx fail against a protected process even when the process
+// handle has PROCESS_CREATE_THREAD. Used only for the MsMpEng test.
+//
+#define IOCTL_PPL_CREATE_REMOTE_THREAD \
+    CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _PPL_REMOTE_THREAD_REQUEST {
+    ULONG   ProcessId;        // target process, for validation
+    ULONG   Flags;            // must be 0 (thread starts immediately)
+    ULONG64 ProcessHandle;    // caller's handle to the target
+    ULONG64 StartAddress;     // user-mode entry point in the target
+    ULONG64 Parameter;        // argument passed to StartAddress
+    ULONG   Reserved;
+    ULONG   Reserved2;
+} PPL_REMOTE_THREAD_REQUEST, *PPPL_REMOTE_THREAD_REQUEST;
+
+typedef struct _PPL_REMOTE_THREAD_RESULT {
+    NTSTATUS Status;
+    ULONG    ThreadId;
+    ULONG    Flags;
+    ULONG    Reserved;
+} PPL_REMOTE_THREAD_RESULT, *PPPL_REMOTE_THREAD_RESULT;
+
+typedef struct _PPL_HANDLE_FIX_REQUEST {
+    ULONG   ProcessId;       // target process the handle must reference
+    ULONG   AccessMask;      // new GrantedAccess (subset of PROCESS_ALL_ACCESS)
+    ULONG64 HandleValue;     // handle in the calling process
+    ULONG   Reserved;
+    ULONG   Reserved2;
+} PPL_HANDLE_FIX_REQUEST, *PPPL_HANDLE_FIX_REQUEST;
+
+typedef struct _PPL_HANDLE_FIX_RESULT {
+    NTSTATUS Status;
+    ULONG    OldGrantedAccess;
+    ULONG    NewGrantedAccess;
+    ULONG64  ObjectPointer;  // EPROCESS the handle referenced, diagnostic only
+    ULONG    Reserved;
+} PPL_HANDLE_FIX_RESULT, *PPPL_HANDLE_FIX_RESULT;
 
 typedef struct _PPL_SET_REQUEST {
     ULONG ProcessId;
@@ -86,6 +175,23 @@ typedef struct _PPL_OPERATION_RESULT {
     UCHAR Reserved[2];
 } PPL_OPERATION_RESULT, *PPPL_OPERATION_RESULT;
 
+typedef struct _PPL_MITIGATION_REQUEST {
+    ULONG ProcessId;
+    ULONG Reserved;     // must be 0
+} PPL_MITIGATION_REQUEST, *PPPL_MITIGATION_REQUEST;
+
+typedef struct _PPL_MITIGATION_RESULT {
+    NTSTATUS Status;
+    ULONG OldMitigationFlags1;
+    ULONG NewMitigationFlags1;
+    ULONG OldMitigationFlags2;
+    ULONG NewMitigationFlags2;
+    UCHAR OldSignatureLevel;
+    UCHAR NewSignatureLevel;
+    UCHAR OldSectionSignatureLevel;
+    UCHAR NewSectionSignatureLevel;
+} PPL_MITIGATION_RESULT, *PPPL_MITIGATION_RESULT;
+
 typedef struct _PPL_QUERY_RESULT {
     NTSTATUS Status;
     ULONG ProcessId;
@@ -94,7 +200,9 @@ typedef struct _PPL_QUERY_RESULT {
     UCHAR Protection;
     UCHAR SignatureLevel;
     UCHAR SectionSignatureLevel;
-    UCHAR Flags;        // bit0 = protected, bit1 = protected light
+    UCHAR Flags;        // PPL_QUERY_FLAG_*
+    ULONG MitigationFlags1;
+    ULONG MitigationFlags2;
 } PPL_QUERY_RESULT, *PPPL_QUERY_RESULT;
 
 typedef struct _PPL_FILTER_REQUEST {

@@ -14,8 +14,8 @@
 // builds. We keep that rule: an unknown build must never be guessed, because
 // writing the wrong EPROCESS byte can bugcheck the machine.
 //
-// Only PsProtectionOffset is used to set PPL. The mitigation-flags and
-// object-table offsets are carried for diagnostics and future work.
+// PsProtectionOffset is used to set PPL. PsMitigationFlags1Offset is used by
+// the allow-dlls operation; the other offsets are diagnostics.
 //
 
 #if defined(_KERNEL_MODE)

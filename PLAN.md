@@ -69,7 +69,9 @@ ppl_executor/
   driver/
     MakeMePPL.vcxproj
     MakeMePPL.c               # DriverEntry, unload, device, IRP dispatch
-    PplProtection.c/.h          # offset table, PS_PROTECTION read/write/verify, tracking
+    PplProtection.c/.h          # PS_PROTECTION read/write/verify, set/clear/query
+    PplMitigation.c/.h          # signature mitigation (allow-dlls) + restore
+    PplTrack.c/.h               # shared change-tracking table and lock
     PplFilter.c/.h              # name filters, process-creation callback, apply-existing
     PplLog.h                    # DbgPrintEx wrapper
   usermode/
@@ -266,15 +268,15 @@ source of truth. It is ported from KDU's `KDUGetEprocessOffsets`
 (`Source/Hamakaze/ps.cpp`) and `PsProtectionOffset_*` (`Source/Hamakaze/ps.h`), and
 covers Windows 8.1 (9600) through Windows 11 25H2 (26200), including `0x87A` for
 19041-22631 and `0x5FA` for 26100-26200. Mitigation-flags and object-table offsets are
-stored alongside for diagnostics.
+stored alongside; `MitigationFlags1` is used by the `ALLOW-DLLS` operation.
 
 - Identify the build with `RtlGetVersion` in `DriverEntry` and cross-check
   `KUSER_SHARED_DATA->NtBuildNumber` (the value KDU reads through
   `NtCurrentPeb()->OSBuildNumber`).
 - Look up the exact build number. If it is unknown (including 26H1/26H2, which KDU does
-  not map yet), load the driver but set offset 0 and make `SET`/`FILTER` return
-  `STATUS_NOT_SUPPORTED`. `GET_INFO` reports the unsupported build. Do **not** guess an
-  offset; a wrong write corrupts `EPROCESS`.
+  not map yet), load the driver but set offset 0 and make `SET`/`FILTER`/`ALLOW-DLLS`
+  return `STATUS_NOT_SUPPORTED`. `GET_INFO` reports the unsupported build. Do **not**
+  guess an offset; a wrong write corrupts `EPROCESS`.
 - Do not make RedEdr's 3-byte `SignatureLevel/SectionSignatureLevel/Protection` scanner
   the primary path. For a freshly created, unprotected process those bytes can all be
   zero, so the scan is ambiguous. Use the build table and verify with
@@ -312,14 +314,19 @@ offset plus the byte readback are the verification; do not claim more than that.
 Use the same write/verify helper for `CLEAR_BY_PID`, passing the byte to restore
 (`OriginalProtection` if tracked, otherwise `0x00`).
 
-Only write the `Protection` byte. Do not touch `SignatureLevel` or
-`SectionSignatureLevel`; KDU and RedEdr only change `Protection`, and that is enough for
-the PPL access checks on these builds. If later testing shows otherwise, investigate
-signature levels as a separate change.
+Only write the `Protection` byte for a PPL grant. Do not touch `SignatureLevel` or
+`SectionSignatureLevel` for PPL; KDU and RedEdr only change `Protection`, and that is
+enough for the PPL access checks on these builds.
 
-For `QUERY`, resolve `PsGetProcessSignatureLevel` and
-`PsGetProcessSectionSignatureLevel` with `MmGetSystemRoutineAddress` (RedEdr does the
-same); if either is unavailable, report 0. These are read-only diagnostics.
+The separate `ALLOW-DLLS` operation intentionally clears
+`MitigationFlags` bit 23 (`SignatureMitigationOptIn`) and zeroes
+`SectionSignatureLevel` (the DLL signature requirement). `MitigationFlags2` is not part of
+the block-non-Microsoft-binaries state and is left alone.
+
+For `QUERY`, read `SignatureLevel`/`SectionSignatureLevel` directly from the two bytes in
+front of `PS_PROTECTION`, and read `MitigationFlags1`/`MitigationFlags2` from the build
+table offsets. These are read-only diagnostics; the undocumented
+`PsGetProcessSignatureLevel` output-pointer ABI is avoided.
 
 For `CLEAR_BY_PID`:
 

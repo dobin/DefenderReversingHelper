@@ -94,6 +94,21 @@ the pipe name; both sides must agree.
 test; it waits for Enter unless `--hold N` is supplied. Do not inject helpers into a target;
 use PID/filter instead. Closing the pipe or stopping the broker does not remove PPL.
 
+## Remove the blockdll mitigation
+
+If the target was created with `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` /
+`PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` (or enabled
+`ProcessSignaturePolicy/MicrosoftSignedOnly` at runtime), unsigned DLLs are refused with
+error 577. Remove that state only for the test target:
+
+```powershell
+& $PplCtl allow-dlls --pid $targetPid
+& $PplCtl query --pid $targetPid   # block non-MS DLLs: off
+```
+
+The change is tracked; `clear --pid` and driver unload restore it. `allow-dlls` returns
+`STATUS_NOT_SUPPORTED` on builds without a MitigationFlags offset.
+
 ## Verify every grant
 
 ```powershell
@@ -123,7 +138,8 @@ protected PID, including filter/broker clients:
 Stop the test broker/clients (Ctrl+C, or a specific recorded PID). Leave the driver loaded.
 Clear protection before attempting to terminate a protected target. `STATUS_NOT_FOUND`
 is harmless if it exited; `STATUS_ACCESS_DENIED` on clear means untracked protection—do
-not force removal. Report failures or remaining PPL to the user; never reboot to fix them.
+not force removal. `clear --pid` also restores an `allow-dlls` change. Report failures or
+remaining PPL to the user; never reboot to fix them.
 For `STATUS_NOT_SUPPORTED`, stop and report an unsupported build or missing callback.
 
 Report method/signer, target PIDs/patterns/pipe, verification results, and cleanup or
