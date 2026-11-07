@@ -8,6 +8,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PplCtl", "usermode\PplCtl.v
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PplTarget", "tests\PplTarget.vcxproj", "{FAC8B150-BFA4-4E53-96B4-935F7EFA5A5F}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DllInjector", "dll_injector\DllInjector.vcxproj", "{D9281BA9-6771-4F76-85D5-8A0CA7B1181C}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DllPayload", "dll_injector\payload\DllPayload.vcxproj", "{A94E129F-85FF-4E96-8F46-973FFA06FBB2}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -26,6 +30,14 @@ Global
 		{FAC8B150-BFA4-4E53-96B4-935F7EFA5A5F}.Debug|x64.Build.0 = Debug|x64
 		{FAC8B150-BFA4-4E53-96B4-935F7EFA5A5F}.Release|x64.ActiveCfg = Release|x64
 		{FAC8B150-BFA4-4E53-96B4-935F7EFA5A5F}.Release|x64.Build.0 = Release|x64
+		{D9281BA9-6771-4F76-85D5-8A0CA7B1181C}.Debug|x64.ActiveCfg = Debug|x64
+		{D9281BA9-6771-4F76-85D5-8A0CA7B1181C}.Debug|x64.Build.0 = Debug|x64
+		{D9281BA9-6771-4F76-85D5-8A0CA7B1181C}.Release|x64.ActiveCfg = Release|x64
+		{D9281BA9-6771-4F76-85D5-8A0CA7B1181C}.Release|x64.Build.0 = Release|x64
+		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Debug|x64.ActiveCfg = Debug|x64
+		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Debug|x64.Build.0 = Debug|x64
+		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Release|x64.ActiveCfg = Release|x64
+		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

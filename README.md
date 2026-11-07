@@ -4,6 +4,11 @@ A test-signed Windows driver and CLI that grant **Protected Process Light (PPL)*
 process by PID, name filter, or named-pipe connection. Default: PPL-Antimalware (`0x31`).
 It can also remove the **block non-Microsoft binaries** process mitigation, so a target can load unsigned or test-signed DLLs.
 
+It ships a DLL injector, `bin\Release\injector.exe`, with driver-backed
+`--ppl`, `--fix-handle`, and `--kernel-thread` options. Together they can load
+a DLL into a protected process such as `MsMpEng.exe`. See
+[dll_injector](dll_injector/README.md) for usage and caveats.
+
 The purpose is to enable AI agents to start tools as PPL. 
 
 > **Isolated test VM only.** Unsupported kernel memory modification can crash Windows.
@@ -62,6 +67,30 @@ $target = Start-Process .\bin\Release\test_target.exe -PassThru
 `query` should show `0x31`;
 `clear` restores the tracked original protection byte and the original DLL
 signature level. Existing handles are not revoked.
+
+### Inject a DLL
+
+Normal target:
+
+```powershell
+$target = Start-Process .\bin\Release\test_target.exe -PassThru
+.\bin\Release\injector.exe $target.Id .\bin\Release\payload.dll
+Get-Content "C:\data\dll_load_$($target.Id).txt"
+```
+
+Protected target (`MsMpEng.exe`) from an elevated console with the driver
+loaded:
+
+```powershell
+.\bin\Release\injector.exe MsMpEng.exe .\bin\Release\payload.dll `
+    --ppl --fix-handle --kernel-thread --restore
+```
+
+`--ppl` clears PPL and the blockdll mitigation before `OpenProcess`;
+`--fix-handle` repairs access stripped by Defender self-protection;
+`--kernel-thread` creates the remote thread from kernel mode; `--restore`
+puts the original protection back afterwards. See
+[dll_injector/README.md](dll_injector/README.md).
 
 For name filters, the on-connect broker, other signers, and all CLI options, see the
 [command reference and examples](GUIDE.md#quick-start).

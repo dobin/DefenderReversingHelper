@@ -62,6 +62,13 @@ ppl_executor/
   tests/
     PplTarget.vcxproj
     PplTarget.cpp                outputs test_target.exe
+  dll_injector/
+    DllInjector.vcxproj
+    DllInjector.cpp              outputs injector.exe (--ppl/--fix-handle/--kernel-thread)
+    README.md                    injector usage and MsMpEng example
+    payload/
+      DllPayload.vcxproj
+      payload.c                  outputs payload.dll (writes C:\data marker)
   scripts/
     Build.ps1
     New-TestCert.ps1
@@ -111,6 +118,8 @@ Outputs:
 bin\Release\MakeMePPL.sys
 bin\Release\PplCtl.exe
 bin\Release\test_target.exe
+bin\Release\injector.exe
+bin\Release\payload.dll
 ```
 
 The driver is linked with `/INTEGRITYCHECK` in both configurations. Verify it:
@@ -246,6 +255,37 @@ The broker itself can also run as a normal user once the driver is loaded, becau
 control device allows all local users. `--admin-only` restricts only the pipe, not the
 device. Installing and starting the driver still require an administrator.
 
+## DLL injection (`dll_injector`)
+
+`dll_injector` integrates the `dll_load` lab injector. It performs remote
+`LoadLibraryW` injection and adds driver-backed options for protected targets.
+
+```powershell
+# Normal target
+$target = Start-Process .\bin\Release\test_target.exe -PassThru
+.\bin\Release\injector.exe $target.Id .\bin\Release\payload.dll
+
+# Protected target (elevated, driver loaded, isolated test VM)
+.\bin\Release\injector.exe MsMpEng.exe .\bin\Release\payload.dll `
+    --ppl --fix-handle --kernel-thread --restore
+```
+
+| Option | Effect |
+|---|---|
+| `--ppl` | Before `OpenProcess`, force-clear PPL (`IOCTL_PPL_FORCE_CLEAR_BY_PID`) and clear the block-non-Microsoft-binaries mitigation (`IOCTL_PPL_ALLOW_NON_MS_DLLS`). Both changes are tracked by the driver. |
+| `--fix-handle` | Restore `GrantedAccess` that Defender self-protection stripped from the `OpenProcess` handle (`IOCTL_PPL_FIX_HANDLE_ACCESS`). |
+| `--kernel-thread` | Create the remote thread from kernel mode via `RtlCreateUserThread` (`IOCTL_PPL_CREATE_REMOTE_THREAD`), bypassing the user-mode protected-process check. |
+| `--restore` | After injection, restore the original protection/mitigation (`IOCTL_PPL_CLEAR_BY_PID`). Only meaningful with `--ppl`. |
+
+The first argument is a PID or an image name (for example `MsMpEng.exe`).
+The payload writes `C:\data\dll_load_<pid>.txt` from `DLL_PROCESS_ATTACH`.
+
+`--ppl` must run before `OpenProcess`, because a PPL process refuses the VM and
+thread-creation rights. Run the injector elevated when targeting `MsMpEng.exe`:
+after PPL is cleared the process is still a SYSTEM process. Without `--restore`,
+run `pplctl clear --pid <pid>` to put the tracked protection back. See
+[dll_injector/README.md](dll_injector/README.md) for details and limitations.
+
 ## Cleanup
 
 Close broker/CLI windows, then run in elevated PowerShell:
@@ -299,6 +339,8 @@ pplctl broker  [--pipe PplGrant] [--signer am] [--audit] [--once] [--admin-only]
 pplctl connect [--pipe PplGrant] [--hold <seconds>]
 pplctl builds
 pplctl version
+
+injector <pid|image name> <full\path\to\payload.dll> [--ppl] [--fix-handle] [--kernel-thread] [--restore]
 ```
 
 `builds` prints the build table compiled into `pplctl`, marks the running OS, and
@@ -438,6 +480,7 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 | 11 | Negatives | PID 0/4, critical names, short/empty patterns, 17th filter refused; non-admin CLI succeeds |
 | 12 | Stability | Many matching create/exit cycles; no bugcheck; reboot clears state |
 | 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
+| 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
 
 ## Troubleshooting
 
@@ -458,6 +501,13 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 - `allow-dlls` succeeds but a DLL still fails to load - the binary signature policy is
   gone, but another mitigation (ACG, image-load policy, or the image itself) may still
   block it. Check `Get-ProcessMitigation -Id <pid>`; `MicrosoftSignedOnly` should be OFF.
+- `injector.exe` reports `OpenProcess failed (error 5)` - run it elevated. For a protected
+  target such as `MsMpEng.exe`, pass `--ppl` so protection is cleared before
+  `OpenProcess`; `--fix-handle` only repairs an existing handle.
+- `CreateRemoteThread` fails or `LoadLibraryW` returns `NULL` - try `--kernel-thread`
+  (protected-process thread check) and `--ppl` (PPL and blockdll mitigation).
+- `injector.exe` reports `Could not open \\.\MakeMePPL` - the driver is not loaded, or the
+  device DACL denied access. Run `pplctl info` first.
 - No `[MakeMePPL]` messages - attach DebugView with kernel capture or use WinDbg.
 
 ## Cleanup

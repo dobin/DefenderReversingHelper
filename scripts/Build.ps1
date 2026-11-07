@@ -74,6 +74,6 @@ $Output = Join-Path $Root "bin\$Configuration"
 Write-Host ''
 Write-Host "Build succeeded. Output: $Output"
 Get-ChildItem $Output -File |
-    Where-Object { $_.Extension -in '.sys', '.exe' } |
+    Where-Object { $_.Extension -in '.sys', '.exe', '.dll' } |
     Select-Object Name, Length |
     Format-Table -AutoSize
