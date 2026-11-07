@@ -2,8 +2,7 @@
 
 A test-signed Windows driver and CLI that grant **Protected Process Light (PPL)** to a
 process by PID, name filter, or named-pipe connection. Default: PPL-Antimalware (`0x31`).
-It can also remove the **block non-Microsoft binaries** process mitigation (Cobalt Strike
-`blockdll`), so a target can load unsigned or test-signed DLLs.
+It can also remove the **block non-Microsoft binaries** process mitigation, so a target can load unsigned or test-signed DLLs.
 
 The purpose is to enable AI agents to start tools as PPL. 
 
