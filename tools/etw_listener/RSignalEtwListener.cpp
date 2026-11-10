@@ -8,8 +8,11 @@
  *
  * Example:
  *
- *     rsignal_etw_listener.exe --dump-bytes 1024 --out rsignal.txt
+ *     rsignal_etw_listener.exe --out rsignal.txt
+ *     rsignal_etw_listener.exe --dump --dump-bytes 1024
  *
+ * By default each call prints one line with signal, flags, the Data address
+ * and the captured data size. --dump adds a hex+ASCII dump.
  * Run it elevated (or from an account in "Performance Log Users"); creating a
  * real-time trace session otherwise fails with ERROR_ACCESS_DENIED. The
  * listener can start before or after the payload registers its provider.
@@ -42,7 +45,7 @@ namespace {
 struct Options {
     std::wstring   session = MPENGINE_ETW_SESSION_NAME;
     std::wstring   outPath;
-    bool           dump = true;
+    bool           dump = false;         /* default: sizes only */
     size_t         dumpBytes = 512;      /* 0 = print everything */
     uint64_t       maxEvents = 0;        /* 0 = unlimited */
     bool           showStatus = true;
@@ -330,50 +333,49 @@ HandleCallEvent(
     int32_t     signal = 0;
     int32_t     flags = 0;
     uint32_t    sequence = 0;
-    uint32_t    contextLength = 0;
     uint32_t    dataLength = 0;
-    uint64_t    contextAddress = 0;
     uint64_t    dataAddress = 0;
-    std::string contextHex;
     std::string dataHex;
-    std::vector<BYTE> contextBytes;
     std::vector<BYTE> dataBytes;
 
     Parser.try_parse(L"SeqNum", sequence);
     Parser.try_parse(L"Signal", signal);
     Parser.try_parse(L"Flags", flags);
-    Parser.try_parse(L"ContextAddress", contextAddress);
     Parser.try_parse(L"DataAddress", dataAddress);
-    Parser.try_parse(L"ContextLength", contextLength);
     Parser.try_parse(L"DataLength", dataLength);
 
     bool hexOk = true;
 
     if (g_options.dump) {
-        Parser.try_parse(L"ContextHex", contextHex);
         Parser.try_parse(L"DataHex", dataHex);
-        hexOk = HexDecode(contextHex, contextBytes) &&
-                HexDecode(dataHex, dataBytes);
+        hexOk = HexDecode(dataHex, dataBytes);
     }
 
-    std::string text = Format(
-        "%s seq=%lu CALL signal=0x%X flags=0x%X context=0x%016llX data=0x%016llX\n",
-        Prefix.c_str(),
-        (unsigned long)sequence,
-        (unsigned int)signal,
-        (unsigned int)flags,
-        (unsigned long long)contextAddress,
-        (unsigned long long)dataAddress);
+    std::string text;
 
-    if (!hexOk) {
-        text += "    (could not decode hex buffer fields)\n";
-    } else if (g_options.dump) {
-        DumpBytes(text, "context", contextBytes, g_options.dumpBytes);
-        DumpBytes(text, "data", dataBytes, g_options.dumpBytes);
+    if (g_options.dump) {
+        text = Format(
+            "%s seq=%lu CALL signal=0x%X flags=0x%X data=0x%016llX\n",
+            Prefix.c_str(),
+            (unsigned long)sequence,
+            (unsigned int)signal,
+            (unsigned int)flags,
+            (unsigned long long)dataAddress);
+
+        if (!hexOk) {
+            text += "    (could not decode hex buffer field)\n";
+        } else {
+            DumpBytes(text, "data", dataBytes, g_options.dumpBytes);
+        }
     } else {
-        text += Format("    context: %lu byte(s), data: %lu byte(s)\n",
-                       (unsigned long)contextLength,
-                       (unsigned long)dataLength);
+        text = Format(
+            "%s seq=%lu CALL signal=0x%X flags=0x%X data=0x%016llX (%lu bytes)\n",
+            Prefix.c_str(),
+            (unsigned long)sequence,
+            (unsigned int)signal,
+            (unsigned int)flags,
+            (unsigned long long)dataAddress,
+            (unsigned long)dataLength);
     }
 
     Print(text);
@@ -464,8 +466,11 @@ Usage(void)
         "\n"
         "  --session <name>   real-time ETW session name\n"
         "  --out <file>       also write the rendered text to <file>\n"
-        "  --no-dump          do not print the context/data buffers\n"
-        "  --dump-bytes <n>   bytes per buffer to print (0 = all, default 512)\n"
+        "  --dump             print a hex+ASCII dump of the data buffer\n"
+        "  --dump-bytes <n>   bytes of the buffer to dump (implies --dump;\n"
+        "                     0 = all, default 512)\n"
+        "  --no-dump          compact output (default): signal, flags,\n"
+        "                     data address and size\n"
         "  --max-events <n>   stop after n events\n"
         "  --quiet-status     hide Status (install/diagnostic) events\n"
         "  --help             show this text\n"
@@ -523,6 +528,8 @@ ParseOptions(
                 return false;
             }
             g_options.outPath = value;
+        } else if (argument == L"--dump") {
+            g_options.dump = true;
         } else if (argument == L"--no-dump") {
             g_options.dump = false;
         } else if (argument == L"--dump-bytes") {
@@ -534,6 +541,7 @@ ParseOptions(
                 return false;
             }
             g_options.dumpBytes = (size_t)parsed;
+            g_options.dump = true;
         } else if (argument == L"--max-events") {
             const wchar_t* value = next(L"--max-events");
 

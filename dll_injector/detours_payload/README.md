@@ -98,22 +98,27 @@ the provider GUID. Creating a session requires elevation (or membership in
 **Performance Log Users**). Useful options:
 
 ```text
---dump-bytes <n>   bytes of each buffer to print (0 = all, default 512)
---no-dump          print lengths only, no hex dump
+--dump             print a hex+ASCII dump of the data buffer
+--dump-bytes <n>   bytes of the buffer to dump (implies --dump; 0 = all, default 512)
+--no-dump          compact output (default): signal, flags, data address, size
 --out <file>       also write the rendered text to a file
 --max-events <n>   stop after n events (handy for scripted runs)
 --quiet-status     hide install/diagnostic Status events
 ```
 
-Example output:
+By default each call is a single line with the arguments and data size:
 
 ```text
-[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 CALL signal=0x4019 flags=0x10 context=0x0000018111E018 data=0x0000004A2B3C0000
-    context: 512 byte(s)
-      0000  44 33 22 11 ...                              |D3".............|
+[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 CALL signal=0x4019 flags=0x10 data=0x0000004A2B3C0000 (976 bytes)
+[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 RETURN status=0x0000800E elapsed=0.123 ms
+```
+
+Add `--dump` for the hex+ASCII payload:
+
+```text
+[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 CALL signal=0x4019 flags=0x10 data=0x0000004A2B3C0000
     data: 976 byte(s)
       0000  EF BE AD DE ...                              |....hello from f|
-[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 RETURN status=0x0000800E elapsed=0.123 ms
 ```
 
 `__rsignal` is a signal/event dispatcher used by the engine. To generate

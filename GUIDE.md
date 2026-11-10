@@ -331,8 +331,9 @@ The payload resolves the export at runtime, enlists all target threads in the
 Detours transaction (and keeps their suspended handles open until commit), and
 installs the hook from a worker thread rather than from `DllMain`. For every
 call it emits all four arguments, the `Context` and `Data` buffers, and the
-return value; the listener prints a hex+ASCII dump. Arguments and return values
-are forwarded unchanged.
+return value; the listener prints the arguments and data size, with `--dump`
+adding a hex+ASCII dump of `Data`. Arguments and return values are forwarded
+unchanged.
 
 Detours must make code pages writable. `--ppl` clears PPL and the
 block-non-Microsoft-binaries mitigation; `--allow-dynamic-code` clears
@@ -551,7 +552,7 @@ change. `allow-dynamic-code` should change the ACG line to `off`.
 | 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
 | 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
 | 15 | allow-dynamic-code | `query` shows `MitigationFlags1` bit 8 cleared; `clear` restores it together with any `allow-dlls` change |
-| 16 | Detours payload | `mpengine_hook.dll` emits `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; `rsignal_etw_listener.exe` shows `RSignalCall`/`RSignalReturn` events with hex dumps |
+| 16 | Detours payload | `mpengine_hook.dll` emits `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; `rsignal_etw_listener.exe` shows `RSignalCall`/`RSignalReturn` summaries (add `--dump` for hex dumps) |
 
 ## Troubleshooting
 

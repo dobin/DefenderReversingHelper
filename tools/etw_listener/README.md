@@ -19,11 +19,20 @@ Options:
 |---|---|
 | `--session <name>` | Override the real-time session name |
 | `--out <file>` | Also write the rendered text to a file |
-| `--no-dump` | Print buffer lengths only |
-| `--dump-bytes <n>` | Bytes per buffer to print (`0` = all, default 512) |
+| `--dump` | Print a hex+ASCII dump of the data buffer |
+| `--dump-bytes <n>` | Bytes of the buffer to dump (implies `--dump`; `0` = all, default 512) |
+| `--no-dump` | Compact output (default): signal, flags, data address and size |
 | `--max-events <n>` | Stop after n events |
 | `--quiet-status` | Hide `Status` (install/diagnostic) events |
 | `--help` | Usage |
+
+By default each call is one line:
+
+```text
+[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 CALL signal=0x4019 flags=0x10 data=0x0000004A2B3C0000 (976 bytes)
+```
+
+Add `--dump` (optionally with `--dump-bytes`) for the hex+ASCII data buffer.
 
 The consumer needs to create an ETW session, so run it elevated or as a member
 of **Performance Log Users**. It can start before or after the payload
