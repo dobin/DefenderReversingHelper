@@ -74,8 +74,12 @@ ppl_executor/
       payload.c                  outputs payload.dll (writes C:\data marker)
     detours_payload/
       MpEngineHook.vcxproj
-      MpEngineHook.c             outputs mpengine_hook.dll (Detours hook)
-      README.md                  hook target, log, ACG caveat
+      MpEngineHook.c             outputs mpengine_hook.dll (Detours hook, ETW)
+      README.md                  hook target, ETW events, ACG caveat
+  tools/etw_listener/
+    RSignalEtwListener.vcxproj
+    RSignalEtwListener.cpp       outputs rsignal_etw_listener.exe (krabsetw)
+    README.md                    consumer usage
   third_party/detours/
     DetoursLib.vcxproj           builds detours.lib from C:\Repos\Detours
     README.md                    Detours source location / override
@@ -312,25 +316,29 @@ run `pplctl clear --pid <pid>` to put the tracked protection back. See
 ### Detours hook payload
 
 `bin\Release\mpengine_hook.dll` is a Microsoft Detours payload. It hooks
-`mpengine.dll!__rsignal`:
+`mpengine.dll!__rsignal` and emits ETW/TraceLogging events for each call:
 
 ```powershell
+# Terminal 1 (elevated)
+.\bin\Release\rsignal_etw_listener.exe --pid <MsMpEng pid>
+
+# Terminal 2 (elevated)
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
-Get-Content C:\data\rsignal_<MsMpEng pid>.log
 ```
 
 The payload resolves the export at runtime, enlists all target threads in the
 Detours transaction (and keeps their suspended handles open until commit), and
 installs the hook from a worker thread rather than from `DllMain`. For every
-call it logs all four arguments, a hex+ASCII dump of `Context` and `Data`, and
-the return value. Arguments and return values are forwarded unchanged.
+call it emits all four arguments, the `Context` and `Data` buffers, and the
+return value; the listener prints a hex+ASCII dump. Arguments and return values
+are forwarded unchanged.
 
 Detours must make code pages writable. `--ppl` clears PPL and the
 block-non-Microsoft-binaries mitigation; `--allow-dynamic-code` clears
 **Arbitrary Code Guard** (`ProcessDynamicCodePolicy`). If ACG is still active,
 the commit fails with `ERROR_DYNAMIC_CODE_BLOCKED` (1655), which the payload
-records in its log. See
+emits as a `Status` error event. See
 [dll_injector/detours_payload/README.md](dll_injector/detours_payload/README.md)
 for changing the hook target and more caveats.
 
@@ -543,7 +551,7 @@ change. `allow-dynamic-code` should change the ACG line to `off`.
 | 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
 | 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
 | 15 | allow-dynamic-code | `query` shows `MitigationFlags1` bit 8 cleared; `clear` restores it together with any `allow-dlls` change |
-| 16 | Detours payload | `mpengine_hook.dll` logs `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; calls and hex dumps appear in `C:\data\rsignal_<pid>.log` |
+| 16 | Detours payload | `mpengine_hook.dll` emits `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; `rsignal_etw_listener.exe` shows `RSignalCall`/`RSignalReturn` events with hex dumps |
 
 ## Troubleshooting
 

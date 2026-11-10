@@ -12,11 +12,13 @@ Together they can load a DLL into a protected process such as `MsMpEng.exe`.
 See [dll_injector](dll_injector/README.md) for usage and caveats.
 
 It also ships `bin\Release\mpengine_hook.dll`, a Microsoft Detours payload that
-hooks `mpengine.dll!__rsignal` and dumps every call's arguments and
-pointed-to data to `C:\data\rsignal_<pid>.log`. Detours is compiled from its
-source checkout (`C:\Repos\Detours` by default). Use `--allow-dynamic-code` in
-addition to `--ppl` when the target has ACG. See
-[dll_injector/detours_payload](dll_injector/detours_payload/README.md).
+hooks `mpengine.dll!__rsignal` and emits each call's arguments and pointed-to
+data as ETW/TraceLogging events. `bin\Release\rsignal_etw_listener.exe`
+(third_party/krabsetw) renders them in another process. Detours is compiled from
+its source checkout (`C:\Repos\Detours` by default). Use `--allow-dynamic-code`
+in addition to `--ppl` when the target has ACG. See
+[dll_injector/detours_payload](dll_injector/detours_payload/README.md) and
+[tools/etw_listener](tools/etw_listener/README.md).
 
 The purpose is to enable AI agents to start tools as PPL. 
 
@@ -108,13 +110,16 @@ loaded:
 puts the original protection back afterwards. See
 [dll_injector/README.md](dll_injector/README.md).
 
-To hook `mpengine.dll!__rsignal` from inside the engine and dump its data,
-inject the Detours payload instead:
+To hook `mpengine.dll!__rsignal` from inside the engine and stream its data over
+ETW, start the listener and then inject the Detours payload:
 
 ```powershell
+# Terminal 1 (elevated)
+.\bin\Release\rsignal_etw_listener.exe --pid <MsMpEng pid>
+
+# Terminal 2 (elevated)
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
-Get-Content C:\data\rsignal_<MsMpEng pid>.log
 ```
 
 For name filters, the on-connect broker, other signers, and all CLI options, see the

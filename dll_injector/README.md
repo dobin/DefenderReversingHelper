@@ -21,14 +21,16 @@ It does not duplicate the IOCTL structs.
 | Injector | `DllInjector.cpp` | `bin\<Configuration>\injector.exe` |
 | Test payload | `payload\payload.c` | `bin\<Configuration>\payload.dll` |
 | Detours payload | `detours_payload\MpEngineHook.c` | `bin\<Configuration>\mpengine_hook.dll` |
+| ETW listener | `..\tools\etw_listener\RSignalEtwListener.cpp` | `bin\<Configuration>\rsignal_etw_listener.exe` |
 | Detours static lib | `..\third_party\detours\DetoursLib.vcxproj` | `bin\<Configuration>\detours.lib` |
 
 `payload.dll` writes a marker file to `C:\data\dll_load_<pid>.txt` from
 `DLL_PROCESS_ATTACH`, so it proves code ran inside the target process.
 `mpengine_hook.dll` installs a Detours hook on `mpengine.dll!__rsignal` and
-dumps every call's arguments and pointed-to data to
-`C:\data\rsignal_<pid>.log`; see
-[detours_payload/README.md](detours_payload/README.md).
+emits every call's arguments and pointed-to data as ETW/TraceLogging events;
+`rsignal_etw_listener.exe` renders them in another process. See
+[detours_payload/README.md](detours_payload/README.md) and
+[../tools/etw_listener](../tools/etw_listener).
 
 > **Isolated test VM only.** `--ppl` removes PPL from a running process and
 > clears a code-integrity mitigation. Injecting into Defender is invasive and
@@ -48,6 +50,7 @@ This produces:
 bin\Release\injector.exe
 bin\Release\payload.dll
 bin\Release\mpengine_hook.dll
+bin\Release\rsignal_etw_listener.exe
 bin\Release\detours.lib
 ```
 
@@ -142,25 +145,32 @@ The `query` protection should be back to `0x31` after `--restore`.
 ### Detours hooking payload (`mpengine_hook.dll`)
 
 `detours_payload` builds a Microsoft Detours DLL whose target is
-`mpengine.dll!__rsignal`. Use the same protected-target command:
+`mpengine.dll!__rsignal`. Start the ETW listener in one elevated console, then
+inject in another:
 
 ```powershell
+# Terminal 1 (elevated)
+.\bin\Release\rsignal_etw_listener.exe --pid <MsMpEng pid>
+
+# Terminal 2 (elevated)
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
-Get-Content C:\data\rsignal_<MsMpEng pid>.log
 ```
 
 The payload waits for `mpengine.dll`, enlists every thread in the Detours
 transaction (keeping the suspended-thread handles open until commit), attaches
-the hook from a worker thread, and logs every `__rsignal` call: all four
-arguments, a hex+ASCII dump of `Context` (512 bytes) and `Data` (up to 4096
-bytes), and the return value. It never changes arguments or return values.
+the hook from a worker thread, and emits ETW events for every `__rsignal` call:
+all four arguments, the `Context` (512 bytes) and `Data` (up to 4096 bytes)
+buffers, and the return value. It never changes arguments or return values.
+Nothing is written to disk by the injected DLL; the listener creates the
+real-time trace session and prints or saves the events.
 
 Detours needs writable `mpengine.dll` code pages. PPL and the DLL signature
 mitigation are cleared by `--ppl`, but **Arbitrary Code Guard**
 (`ProcessDynamicCodePolicy`) is separate and is cleared by
 `--allow-dynamic-code` (`pplctl allow-dynamic-code --pid <pid>`). Without it,
-`DetourTransactionCommit` fails with `ERROR_DYNAMIC_CODE_BLOCKED` (1655). See
+`DetourTransactionCommit` fails with `ERROR_DYNAMIC_CODE_BLOCKED` (1655), which
+appears as a `Status` event when the listener is attached. See
 [detours_payload/README.md](detours_payload/README.md) for the hook source,
 changing the target function, and more caveats.
 

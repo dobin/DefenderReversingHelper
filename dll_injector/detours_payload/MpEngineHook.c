@@ -10,14 +10,20 @@
  *
  *     ULONG __rsignal(PVOID Context, int Signal, PVOID Data, int Flags)
  *
- * Every call is appended to:
+ * Every call is reported as ETW/TraceLogging events from the provider defined
+ * in shared\MpEngineEtw.h. Nothing is written to disk by this DLL; a separate
+ * process (tools\etw_listener) subscribes to the provider and renders the
+ * events. Each call produces:
  *
- *     C:\data\rsignal_<pid>.log
+ *     RSignalCall    all four arguments, a hex copy of the Context buffer
+ *                    (RSI_CONTEXT_DUMP_BYTES) and of the Data buffer
+ *                    (RSI_DATA_DUMP_BYTES), captured before the real function
+ *                    runs so the payload is exactly what mpengine received
+ *     RSignalReturn  the return value and elapsed time in microseconds
+ *     Status         install/diagnostic messages ("payload attached", errors)
  *
- * Each entry contains all four arguments, a hex+ASCII dump of the Context
- * pointer (RSI_CONTEXT_DUMP_BYTES), a hex+ASCII dump of the Data pointer
- * (RSI_DATA_DUMP_BYTES), and the return value. The buffers are written before
- * the real function runs, so the dump shows the data exactly as received.
+ * When no ETW session has the provider enabled, TraceLoggingWrite is a cheap
+ * no-op and the buffers are not even read.
  *
  * Build output: bin\<Configuration>\mpengine_hook.dll
  *
@@ -28,8 +34,7 @@
  *
  * Detours needs to change the protection of mpengine's code pages. If the
  * target also enables Arbitrary Code Guard (ProcessDynamicCodePolicy), the
- * commit fails and the log records ERROR_DYNAMIC_CODE_BLOCKED (1655). Pass
- * --allow-dynamic-code so the injector clears ACG first.
+ * commit fails. Pass --allow-dynamic-code so the injector clears ACG first.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -43,15 +48,16 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <string.h>
+#include <evntrace.h>
+#include <TraceLoggingProvider.h>
 
 #pragma warning(push)
 #pragma warning(disable: 4201) /* Detours uses a nameless struct/union. */
 #include "detours.h"
 #pragma warning(pop)
 
-#define LOG_DIR             "C:\\data"
-#define LOG_FILE_PATTERN    LOG_DIR "\\rsignal_%lu.log"
+#include "MpEngineEtw.h"
+
 #define MPENGINE_DLL_NAME   "mpengine.dll"
 #define MPENGINE_DLL_WNAME  L"mpengine.dll"
 
@@ -68,7 +74,7 @@
 #define MPENGINE_MODULE_WAIT_MS 30000
 #endif
 
-/* How much memory to dump behind each pointer. */
+/* How much memory to copy behind each pointer into the ETW event. */
 #ifndef RSI_CONTEXT_DUMP_BYTES
 #define RSI_CONTEXT_DUMP_BYTES 512
 #endif
@@ -76,9 +82,16 @@
 #define RSI_DATA_DUMP_BYTES 4096
 #endif
 
-/* Stop writing after this much data so a noisy engine cannot fill the disk. */
-#ifndef RSI_MAX_LOG_BYTES
-#define RSI_MAX_LOG_BYTES (64ull * 1024ull * 1024ull)
+#if (RSI_CONTEXT_DUMP_BYTES <= 0) || (RSI_DATA_DUMP_BYTES <= 0)
+#error RSI_*_DUMP_BYTES must be greater than zero
+#endif
+
+/*
+ * The buffers travel as hex text, so each dump byte costs two characters.
+ * ETW events are limited to 64 KB; keep both buffers well under that.
+ */
+#if (RSI_CONTEXT_DUMP_BYTES > 8192) || (RSI_DATA_DUMP_BYTES > 16384)
+#error RSI_*_DUMP_BYTES are too large for a single ETW event
 #endif
 
 /* detours.h only defines this internally; it is a normal Win32 error code. */
@@ -101,213 +114,216 @@ typedef ULONG (WINAPI *PFN___rsignal)(
     PVOID Data,
     int Flags);
 
+TRACELOGGING_DEFINE_PROVIDER(
+    g_hRSignalProvider,
+    MPENGINE_ETW_PROVIDER_NAME,
+    MPENGINE_ETW_PROVIDER_GUID);
+
 static PFN___rsignal g_Real__rsignal = NULL;
-static volatile LONG g_LogEnabled = 1;
 static volatile LONG g_HookCalls = 0;
-static CRITICAL_SECTION g_LogLock;
-static BOOLEAN g_LogLockInitialized = FALSE;
-static BOOLEAN g_LogLimitNoted = FALSE;
-static ULONGLONG g_LogBytes = 0;
+static volatile LONG g_ProviderRegistered = 0;
+static ULONGLONG g_QpcFrequency = 0;
 static __declspec(thread) LONG g_InHook = 0;
 
 /* ------------------------------------------------------------------------- */
-/* Logging                                                                   */
+/* ETW                                                                       */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Status events carry human-readable install/diagnostic messages. The level
+ * must be a compile-time constant (TraceLoggingWrite turns it into an enum),
+ * hence the two wrappers.
+ */
 static void
-WriteLogPrefixLocked(
-    _In_ FILE* File)
+EmitStatusInfo(
+    _In_ ULONG Code,
+    _In_ const char* Message)
 {
-    SYSTEMTIME now;
-
-    GetLocalTime(&now);
-    fprintf(File,
-            "[%04u-%02u-%02u %02u:%02u:%02u.%03u] pid=%lu tid=%lu ",
-            now.wYear, now.wMonth, now.wDay,
-            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
-            (unsigned long)GetCurrentProcessId(),
-            (unsigned long)GetCurrentThreadId());
-}
-
-static FILE*
-OpenLogLocked(void)
-{
-    char path[MAX_PATH];
-
-    if (!g_LogLockInitialized) {
-        return NULL;
-    }
-
-    CreateDirectoryA(LOG_DIR, NULL);
-    _snprintf_s(path, sizeof(path), _TRUNCATE,
-                LOG_FILE_PATTERN, (unsigned long)GetCurrentProcessId());
-
-    if (g_LogBytes >= RSI_MAX_LOG_BYTES) {
-        if (!g_LogLimitNoted) {
-            FILE* file;
-
-            g_LogLimitNoted = TRUE;
-            file = fopen(path, "a");
-            if (file != NULL) {
-                WriteLogPrefixLocked(file);
-                fprintf(file,
-                        "[!] log size limit (%llu bytes) reached; "
-                        "further calls are not logged\n",
-                        (unsigned long long)RSI_MAX_LOG_BYTES);
-                fclose(file);
-            }
-        }
-        return NULL;
-    }
-
-    return fopen(path, "a");
-}
-
-static void
-CloseLogLocked(
-    _In_ FILE* File)
-{
-    if (File == NULL) {
+    if (!g_ProviderRegistered) {
         return;
     }
 
-    {
-        __int64 size = _ftelli64(File);
-
-        if (size > 0) {
-            g_LogBytes += (ULONGLONG)size;
-        }
-    }
-    fclose(File);
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_STATUS,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_STATUS, "Type"),
+        TraceLoggingUInt32(0, "SeqNum"),
+        TraceLoggingUInt32(Code, "Code"),
+        TraceLoggingString(Message, "Message"));
 }
 
 static void
-LogV(
-    _In_ const char* Format,
-    _In_ va_list Arguments)
+EmitStatusError(
+    _In_ ULONG Code,
+    _In_ const char* Message)
 {
-    char  message[1024];
-    FILE* file;
-
-    if (!g_LogLockInitialized) {
+    if (!g_ProviderRegistered) {
         return;
     }
 
-    _vsnprintf_s(message, sizeof(message), _TRUNCATE, Format, Arguments);
-
-    EnterCriticalSection(&g_LogLock);
-    file = OpenLogLocked();
-    if (file != NULL) {
-        WriteLogPrefixLocked(file);
-        fprintf(file, "%s\n", message);
-        CloseLogLocked(file);
-    }
-    LeaveCriticalSection(&g_LogLock);
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_STATUS,
+        TraceLoggingLevel(TRACE_LEVEL_ERROR),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_STATUS, "Type"),
+        TraceLoggingUInt32(0, "SeqNum"),
+        TraceLoggingUInt32(Code, "Code"),
+        TraceLoggingString(Message, "Message"));
 }
 
 static void
-Log(
+EmitStatusInfoV(
+    _In_ ULONG Code,
     _In_ const char* Format,
     ...)
 {
+    char message[1024];
     va_list arguments;
 
     va_start(arguments, Format);
-    LogV(Format, arguments);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, Format, arguments);
     va_end(arguments);
+
+    EmitStatusInfo(Code, message);
 }
 
 static void
-LogDump(
-    _In_ const char* Label,
-    _In_ const void* Address,
-    _In_ SIZE_T Bytes)
+EmitStatusErrorV(
+    _In_ ULONG Code,
+    _In_ const char* Format,
+    ...)
 {
-    BYTE  buffer[RSI_DATA_DUMP_BYTES];
-    SIZE_T read = 0;
-    SIZE_T i;
-    FILE* file;
+    char message[1024];
+    va_list arguments;
+
+    va_start(arguments, Format);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, Format, arguments);
+    va_end(arguments);
+
+    EmitStatusError(Code, message);
+}
+
+/*
+ * Copy up to Capacity bytes from Address into Buffer. Reads only the part of
+ * the request that lies inside one committed, non-guard region, so a pointer
+ * near the end of a page does not make ReadProcessMemory fail as a whole.
+ * Returns the number of bytes actually copied.
+ */
+static SIZE_T
+CopyTargetMemory(
+    _In_ const void* Address,
+    _Out_writes_bytes_(Capacity) void* Buffer,
+    _In_ SIZE_T Capacity)
+{
     MEMORY_BASIC_INFORMATION memoryInfo;
     SIZE_T available;
+    SIZE_T read = 0;
 
-    if (Address == NULL) {
-        Log("%s: (null)", Label);
-        return;
+    if (Address == NULL || Capacity == 0) {
+        return 0;
     }
 
-    if (Bytes == 0 || Bytes > sizeof(buffer)) {
-        Bytes = sizeof(buffer);
-    }
-
-    /*
-     * Do not ask ReadProcessMemory for bytes that cross into an uncommitted
-     * or guard page: it fails the whole request. Clamp to the region that is
-     * actually readable from Address.
-     */
     if (VirtualQuery(Address, &memoryInfo, sizeof(memoryInfo)) == 0 ||
         memoryInfo.State != MEM_COMMIT ||
         (memoryInfo.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-        Log("%s @ %p: unreadable (raw value 0x%p)",
-            Label, Address, Address);
-        return;
+        return 0;
     }
 
     available = (SIZE_T)((const BYTE*)memoryInfo.BaseAddress +
                          memoryInfo.RegionSize -
                          (const BYTE*)Address);
-    if (Bytes > available) {
-        Bytes = available;
+    if (Capacity > available) {
+        Capacity = available;
     }
-    if (Bytes == 0) {
-        Log("%s @ %p: unreadable (raw value 0x%p)",
-            Label, Address, Address);
-        return;
+    if (Capacity == 0) {
+        return 0;
     }
 
-    if (!ReadProcessMemory(GetCurrentProcess(), Address, buffer, Bytes, &read) &&
-        read == 0) {
-        Log("%s @ %p: unreadable (raw value 0x%p)",
-            Label, Address, Address);
-        return;
+    if (!ReadProcessMemory(GetCurrentProcess(), Address, Buffer, Capacity, &read)) {
+        /* Keep whatever prefix ReadProcessMemory managed to copy. */
     }
 
-    EnterCriticalSection(&g_LogLock);
-    file = OpenLogLocked();
-    if (file != NULL) {
-        WriteLogPrefixLocked(file);
-        fprintf(file, "%s @ %p, %llu byte(s):\n",
-                Label, Address, (unsigned long long)read);
+    return read;
+}
 
-        for (i = 0; i < read; i += 16) {
-            char   hex[16 * 3 + 1];
-            char   ascii[16 + 1];
-            SIZE_T count = read - i;
-            SIZE_T j;
+/*
+ * The buffers are sent as hex text instead of TraceLoggingBinary. TraceLogging
+ * binary fields are length-prefixed, and how much of that prefix a consumer
+ * sees depends on its TDH usage; hex strings decode identically everywhere
+ * (krabsetw, WPA, xperf) and stay well below the 64 KB ETW event limit.
+ */
+static void
+BytesToHex(
+    _In_reads_bytes_(Length) const BYTE* Bytes,
+    _In_ SIZE_T Length,
+    _Out_writes_z_(Length * 2 + 1) char* Hex)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    SIZE_T i;
 
-            if (count > 16) {
-                count = 16;
-            }
-
-            memset(hex, 0, sizeof(hex));
-            memset(ascii, 0, sizeof(ascii));
-
-            for (j = 0; j < count; ++j) {
-                BYTE value = buffer[i + j];
-
-                _snprintf_s(hex + j * 3, sizeof(hex) - j * 3, _TRUNCATE,
-                            "%02X ", value);
-                ascii[j] = (value >= 0x20 && value <= 0x7E)
-                               ? (char)value
-                               : '.';
-            }
-
-            fprintf(file, "    %04llX  %-47s  |%s|\n",
-                    (unsigned long long)i, hex, ascii);
-        }
-
-        CloseLogLocked(file);
+    for (i = 0; i < Length; ++i) {
+        Hex[i * 2] = digits[Bytes[i] >> 4];
+        Hex[i * 2 + 1] = digits[Bytes[i] & 0x0F];
     }
-    LeaveCriticalSection(&g_LogLock);
+    Hex[Length * 2] = '\0';
+}
+
+static void
+EmitCall(
+    _In_ PVOID Context,
+    _In_ int Signal,
+    _In_ PVOID Data,
+    _In_ int Flags,
+    _In_ LONG Sequence)
+{
+    BYTE contextBytes[RSI_CONTEXT_DUMP_BYTES];
+    BYTE dataBytes[RSI_DATA_DUMP_BYTES];
+    char contextHex[RSI_CONTEXT_DUMP_BYTES * 2 + 1];
+    char dataHex[RSI_DATA_DUMP_BYTES * 2 + 1];
+    SIZE_T contextLength;
+    SIZE_T dataLength;
+
+    /*
+     * Copy before calling the real function: Data may point to a transient
+     * structure that the handler releases or rewrites.
+     */
+    contextLength = CopyTargetMemory(Context, contextBytes, sizeof(contextBytes));
+    dataLength = CopyTargetMemory(Data, dataBytes, sizeof(dataBytes));
+
+    BytesToHex(contextBytes, contextLength, contextHex);
+    BytesToHex(dataBytes, dataLength, dataHex);
+
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_CALL,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_CALL, "Type"),
+        TraceLoggingUInt32((UINT32)Sequence, "SeqNum"),
+        TraceLoggingInt32(Signal, "Signal"),
+        TraceLoggingInt32(Flags, "Flags"),
+        TraceLoggingUInt64((UINT64)(ULONG_PTR)Context, "ContextAddress"),
+        TraceLoggingUInt64((UINT64)(ULONG_PTR)Data, "DataAddress"),
+        TraceLoggingUInt32((UINT32)contextLength, "ContextLength"),
+        TraceLoggingUInt32((UINT32)dataLength, "DataLength"),
+        TraceLoggingString(contextHex, "ContextHex"),
+        TraceLoggingString(dataHex, "DataHex"));
+}
+
+static void
+EmitReturn(
+    _In_ LONG Sequence,
+    _In_ ULONG Status,
+    _In_ ULONGLONG ElapsedUs)
+{
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_RETURN,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_RETURN, "Type"),
+        TraceLoggingUInt32((UINT32)Sequence, "SeqNum"),
+        TraceLoggingUInt32(Status, "Status"),
+        TraceLoggingUInt64(ElapsedUs, "ElapsedUs"));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -324,14 +340,17 @@ Hook___rsignal(
     PFN___rsignal real = g_Real__rsignal;
     ULONG status;
     LONG  call;
+    LARGE_INTEGER start = { 0 };
+    LARGE_INTEGER end = { 0 };
+    ULONGLONG elapsedUs = 0;
 
     if (real == NULL) {
         return 0;
     }
 
     /*
-     * If a log write itself signals on this thread, forward without logging.
-     * A global log-size limit covers recursive calls from other threads.
+     * If an ETW write itself signals on this thread, forward without
+     * emitting. This also bounds recursion if the provider is re-entered.
      */
     if (InterlockedIncrement(&g_InHook) > 1) {
         InterlockedDecrement(&g_InHook);
@@ -340,22 +359,27 @@ Hook___rsignal(
 
     call = InterlockedIncrement(&g_HookCalls);
 
-    if (g_LogEnabled) {
-        Log("__rsignal(ctx=%p, signal=0x%X, data=%p, flags=0x%X (%d)) call=%ld",
-            Context, Signal, Data, (unsigned int)Flags, Flags, (long)call);
-        /*
-         * Dump before calling the real function: Data may point to a transient
-         * structure that the handler releases or rewrites.
-         */
-        LogDump("context", Context, RSI_CONTEXT_DUMP_BYTES);
-        LogDump("data", Data, RSI_DATA_DUMP_BYTES);
+    if (TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitCall(Context, Signal, Data, Flags, call);
+    }
+
+    if (g_QpcFrequency != 0) {
+        QueryPerformanceCounter(&start);
     }
 
     status = real(Context, Signal, Data, Flags);
 
-    if (g_LogEnabled) {
-        Log("__rsignal -> 0x%08lX (call=%ld)",
-            (unsigned long)status, (long)call);
+    if (g_QpcFrequency != 0) {
+        QueryPerformanceCounter(&end);
+        if (end.QuadPart >= start.QuadPart) {
+            elapsedUs = (ULONGLONG)
+                (((end.QuadPart - start.QuadPart) * 1000000ull) /
+                 g_QpcFrequency);
+        }
+    }
+
+    if (TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitReturn(call, status, elapsedUs);
     }
 
     InterlockedDecrement(&g_InHook);
@@ -410,9 +434,9 @@ EnlistProcessThreads(
 
     snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        Log("[!] CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed: %lu; "
-            "only the current thread is covered",
-            (unsigned long)GetLastError());
+        EmitStatusErrorV(GetLastError(),
+                         "CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed; "
+                         "only the current thread is covered");
         return 0;
     }
 
@@ -451,8 +475,8 @@ EnlistProcessThreads(
     }
 
     CloseHandle(snapshot);
-    Log("[*] Detours enlisted %lu thread(s), skipped %lu",
-        (unsigned long)enlisted, (unsigned long)skipped);
+    EmitStatusInfoV(0, "Detours enlisted %lu thread(s), skipped %lu",
+                    (unsigned long)enlisted, (unsigned long)skipped);
     return enlisted;
 }
 
@@ -477,10 +501,21 @@ InstallHooksThread(
     char    host[MAX_PATH] = { 0 };
     HANDLE  threadHandles[MAX_ENLISTED_THREADS];
     DWORD   threadCount = 0;
+    LARGE_INTEGER frequency = { 0 };
 
     (void)Parameter;
 
-    CreateDirectoryA(LOG_DIR, NULL);
+    /*
+     * Register before anything else so that even early failures are visible
+     * to the listener. TraceLoggingRegister must not be called from DllMain;
+     * this worker thread makes it safe.
+     */
+    if (SUCCEEDED(TraceLoggingRegister(g_hRSignalProvider))) {
+        InterlockedExchange(&g_ProviderRegistered, 1);
+    }
+
+    QueryPerformanceFrequency(&frequency);
+    g_QpcFrequency = (ULONGLONG)frequency.QuadPart;
 
     /*
      * No-op unless the process was started through DetourCreateProcessWithDll*.
@@ -490,32 +525,32 @@ InstallHooksThread(
     (void)DetourRestoreAfterWith();
 
     (void)GetModuleFileNameA(NULL, host, sizeof(host));
-    Log("payload attached: pid=%lu host=%s",
-        (unsigned long)GetCurrentProcessId(), host);
+    EmitStatusInfoV(0, "payload attached: pid=%lu host=%s",
+                    (unsigned long)GetCurrentProcessId(), host);
 
     engine = WaitForModule(MPENGINE_DLL_WNAME, MPENGINE_MODULE_WAIT_MS);
     if (engine == NULL) {
-        Log("[!] %s is not loaded after %lu ms; no hook installed",
-            MPENGINE_DLL_NAME, (unsigned long)MPENGINE_MODULE_WAIT_MS);
+        EmitStatusErrorV(0, "%s is not loaded after %lu ms; no hook installed",
+                         MPENGINE_DLL_NAME,
+                         (unsigned long)MPENGINE_MODULE_WAIT_MS);
         return 0;
     }
-    Log("[+] %s @ 0x%p", MPENGINE_DLL_NAME, (void*)engine);
+    EmitStatusInfoV(0, "%s @ 0x%p", MPENGINE_DLL_NAME, (void*)engine);
 
     g_Real__rsignal = (PFN___rsignal)
         GetProcAddress(engine, MPENGINE_HOOK_EXPORT);
     if (g_Real__rsignal == NULL) {
-        Log("[!] export %s!%s not found: %lu",
-            MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
-            (unsigned long)GetLastError());
+        EmitStatusErrorV(GetLastError(), "export %s!%s not found",
+                         MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT);
         return 0;
     }
-    Log("[+] target %s!%s @ 0x%p",
-        MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
-        (void*)g_Real__rsignal);
+    EmitStatusInfoV(0, "target %s!%s @ 0x%p",
+                    MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
+                    (void*)g_Real__rsignal);
 
     error = DetourTransactionBegin();
     if (error != NO_ERROR) {
-        Log("[!] DetourTransactionBegin failed: %ld", (long)error);
+        EmitStatusErrorV((ULONG)error, "DetourTransactionBegin failed");
         return 0;
     }
 
@@ -524,8 +559,8 @@ InstallHooksThread(
     error = DetourAttach((PVOID*)&g_Real__rsignal,
                          (PVOID)Hook___rsignal);
     if (error != NO_ERROR) {
-        Log("[!] DetourAttach(%s) failed: %ld", MPENGINE_HOOK_EXPORT,
-            (long)error);
+        EmitStatusErrorV((ULONG)error, "DetourAttach(%s) failed",
+                         MPENGINE_HOOK_EXPORT);
         (void)DetourTransactionAbort();
         ReleaseThreadHandles(threadHandles, threadCount);
         return 0;
@@ -534,22 +569,24 @@ InstallHooksThread(
     error = DetourTransactionCommit();
     ReleaseThreadHandles(threadHandles, threadCount);
     if (error != NO_ERROR) {
-        Log("[!] DetourTransactionCommit failed: %ld (Win32 %lu)",
-            (long)error, (unsigned long)GetLastError());
+        ULONG lastError = GetLastError();
+
+        EmitStatusErrorV((ULONG)error, "DetourTransactionCommit failed: %ld "
+                         "(Win32 %lu)", (long)error, (unsigned long)lastError);
         if (error == ERROR_DYNAMIC_CODE_BLOCKED) {
-            Log("[!] the target has Arbitrary Code Guard (ACG); it must be "
-                "cleared before Detours can patch mpengine code");
+            EmitStatusErrorV(0, "the target has Arbitrary Code Guard (ACG); it "
+                             "must be cleared before Detours can patch mpengine "
+                             "code");
         } else if (error == ERROR_ACCESS_DENIED) {
-            Log("[!] access denied; PPL/signature mitigations may still be "
-                "active, or the code pages are protected");
+            EmitStatusErrorV(0, "access denied; PPL/signature mitigations may "
+                             "still be active, or the code pages are protected");
         }
         return 0;
     }
 
-    InterlockedExchange(&g_LogEnabled, 1);
-    Log("[+] Detours hook installed: %s!%s -> 0x%p",
-        MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
-        (void*)Hook___rsignal);
+    EmitStatusInfoV(0, "Detours hook installed: %s!%s -> 0x%p",
+                    MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
+                    (void*)Hook___rsignal);
     return 0;
 }
 
@@ -570,20 +607,14 @@ DllMain(
 
         DisableThreadLibraryCalls(Instance);
 
-        InitializeCriticalSection(&g_LogLock);
-        g_LogLockInitialized = TRUE;
-
         /*
-         * Do not call Detours from DllMain. The loader lock is held here and
-         * DetourTransactionCommit suspends threads and changes page
-         * protections; a worker thread keeps that out of the loader path.
+         * Do not call Detours or TraceLoggingRegister from DllMain. The
+         * loader lock is held here; a worker thread keeps both out of the
+         * loader path.
          */
         thread = CreateThread(NULL, 0, InstallHooksThread, NULL, 0, NULL);
         if (thread != NULL) {
             CloseHandle(thread);
-        } else {
-            Log("[!] CreateThread(InstallHooksThread) failed: %lu",
-                (unsigned long)GetLastError());
         }
         break;
     }
@@ -593,15 +624,13 @@ DllMain(
          * FreeLibrary/Detach is not supported: the Detours trampoline lives in
          * this DLL, so unloading it while a hook is installed would leave
          * mpengine calling into unmapped memory. Process termination removes
-         * both safely.
+         * both safely. Still unregister the provider: ETW keeps a callback
+         * into this module.
          */
-        if (g_LogLockInitialized) {
-            if (Reserved == NULL) {
-                Log("[*] FreeLibrary requested; hooks are left installed");
-            }
-            g_LogLockInitialized = FALSE;
-            DeleteCriticalSection(&g_LogLock);
+        if (InterlockedExchange(&g_ProviderRegistered, 0) != 0) {
+            TraceLoggingUnregister(g_hRSignalProvider);
         }
+        (void)Reserved;
         break;
 
     default:
