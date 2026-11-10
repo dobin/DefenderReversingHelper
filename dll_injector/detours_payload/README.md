@@ -98,7 +98,6 @@ the provider GUID. Creating a session requires elevation (or membership in
 **Performance Log Users**). Useful options:
 
 ```text
---pid <pid>        only show events from this process (e.g. MsMpEng.exe)
 --dump-bytes <n>   bytes of each buffer to print (0 = all, default 512)
 --no-dump          print lengths only, no hex dump
 --out <file>       also write the rendered text to a file

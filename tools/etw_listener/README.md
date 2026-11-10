@@ -8,7 +8,7 @@ uses the header-only [krabsetw](../../third_party/krabsetw) library.
 
 ```powershell
 # Elevated PowerShell. Start the listener first, then inject.
-.\bin\Release\rsignal_etw_listener.exe --pid <MsMpEng pid> --out rsignal.txt
+.\bin\Release\rsignal_etw_listener.exe --out rsignal.txt
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
 ```
@@ -17,7 +17,6 @@ Options:
 
 | Option | Meaning |
 |---|---|
-| `--pid <pid>` | Only show events from one process |
 | `--session <name>` | Override the real-time session name |
 | `--out <file>` | Also write the rendered text to a file |
 | `--no-dump` | Print buffer lengths only |

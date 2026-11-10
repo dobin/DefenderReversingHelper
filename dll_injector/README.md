@@ -150,7 +150,7 @@ inject in another:
 
 ```powershell
 # Terminal 1 (elevated)
-.\bin\Release\rsignal_etw_listener.exe --pid <MsMpEng pid>
+.\bin\Release\rsignal_etw_listener.exe --out rsignal.txt
 
 # Terminal 2 (elevated)
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `

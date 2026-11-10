@@ -8,7 +8,7 @@
  *
  * Example:
  *
- *     rsignal_etw_listener.exe --pid 1234 --dump-bytes 1024 --out rsignal.txt
+ *     rsignal_etw_listener.exe --dump-bytes 1024 --out rsignal.txt
  *
  * Run it elevated (or from an account in "Performance Log Users"); creating a
  * real-time trace session otherwise fails with ERROR_ACCESS_DENIED. The
@@ -40,7 +40,6 @@
 namespace {
 
 struct Options {
-    DWORD          pid = 0;              /* 0 = every process */
     std::wstring   session = MPENGINE_ETW_SESSION_NAME;
     std::wstring   outPath;
     bool           dump = true;
@@ -405,10 +404,6 @@ OnEvent(
     _In_ const EVENT_RECORD& Record,
     _In_ const krabs::trace_context& Context)
 {
-    if (g_options.pid != 0 && Record.EventHeader.ProcessId != g_options.pid) {
-        return;
-    }
-
     try {
         krabs::schema  schema(Record, Context.schema_locator);
         krabs::parser  parser(schema);
@@ -467,10 +462,9 @@ Usage(void)
         "\n"
         "Usage: rsignal_etw_listener [options]\n"
         "\n"
-        "  --pid <pid>        only show events from this process\n"
         "  --session <name>   real-time ETW session name\n"
-        "  --out <file>       also append the rendered text to <file>\n"
-        "  --no-dump          do not print binary context/data buffers\n"
+        "  --out <file>       also write the rendered text to <file>\n"
+        "  --no-dump          do not print the context/data buffers\n"
         "  --dump-bytes <n>   bytes per buffer to print (0 = all, default 512)\n"
         "  --max-events <n>   stop after n events\n"
         "  --quiet-status     hide Status (install/diagnostic) events\n"
@@ -515,15 +509,6 @@ ParseOptions(
             Usage();
             g_helpRequested = true;
             return false;
-        } else if (argument == L"--pid") {
-            const wchar_t* value = next(L"--pid");
-            uint64_t parsed = 0;
-
-            if (value == nullptr || !ParseUnsigned(value, parsed)) {
-                fprintf(stderr, "invalid --pid\n");
-                return false;
-            }
-            g_options.pid = (DWORD)parsed;
         } else if (argument == L"--session") {
             const wchar_t* value = next(L"--session");
 
@@ -607,15 +592,6 @@ wmain(
 
     Print(Format("provider : %ls\n", MPENGINE_ETW_PROVIDER_GUID_STRING));
     Print(Format("session  : %ls\n", g_options.session.c_str()));
-
-    {
-        std::string pidFilter = g_options.pid == 0
-                                    ? "all processes"
-                                    : Format("pid=%lu",
-                                             (unsigned long)g_options.pid);
-        Print(Format("filter   : %s\n", pidFilter.c_str()));
-    }
-
     Print("waiting for events; press Ctrl+C to stop\n\n");
 
     {
