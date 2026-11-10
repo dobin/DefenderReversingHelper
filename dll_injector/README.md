@@ -25,9 +25,9 @@ It does not duplicate the IOCTL structs.
 
 `payload.dll` writes a marker file to `C:\data\dll_load_<pid>.txt` from
 `DLL_PROCESS_ATTACH`, so it proves code ran inside the target process.
-`mpengine_hook.dll` installs a Detours hook on
-`mpengine.dll!MpContainerAnalyze` and logs to
-`C:\data\mpengine_hook_<pid>.log`; see
+`mpengine_hook.dll` installs a Detours hook on `mpengine.dll!__rsignal` and
+dumps every call's arguments and pointed-to data to
+`C:\data\rsignal_<pid>.log`; see
 [detours_payload/README.md](detours_payload/README.md).
 
 > **Isolated test VM only.** `--ppl` removes PPL from a running process and
@@ -141,19 +141,20 @@ The `query` protection should be back to `0x31` after `--restore`.
 
 ### Detours hooking payload (`mpengine_hook.dll`)
 
-`detours_payload` builds a Microsoft Detours DLL whose example hook is
-`mpengine.dll!MpContainerAnalyze`. Use the same protected-target command:
+`detours_payload` builds a Microsoft Detours DLL whose target is
+`mpengine.dll!__rsignal`. Use the same protected-target command:
 
 ```powershell
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
-Get-Content C:\data\mpengine_hook_<MsMpEng pid>.log
+Get-Content C:\data\rsignal_<MsMpEng pid>.log
 ```
 
 The payload waits for `mpengine.dll`, enlists every thread in the Detours
-transaction, attaches the hook from a worker thread (never under the loader
-lock), and logs the first ten/every thousandth call. It never changes arguments
-or return values.
+transaction (keeping the suspended-thread handles open until commit), attaches
+the hook from a worker thread, and logs every `__rsignal` call: all four
+arguments, a hex+ASCII dump of `Context` (512 bytes) and `Data` (up to 4096
+bytes), and the return value. It never changes arguments or return values.
 
 Detours needs writable `mpengine.dll` code pages. PPL and the DLL signature
 mitigation are cleared by `--ppl`, but **Arbitrary Code Guard**

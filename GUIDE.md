@@ -311,18 +311,20 @@ run `pplctl clear --pid <pid>` to put the tracked protection back. See
 
 ### Detours hook payload
 
-`bin\Release\mpengine_hook.dll` is a Microsoft Detours payload. Its example
-hook is `mpengine.dll!MpContainerAnalyze`:
+`bin\Release\mpengine_hook.dll` is a Microsoft Detours payload. It hooks
+`mpengine.dll!__rsignal`:
 
 ```powershell
 .\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
     --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
-Get-Content C:\data\mpengine_hook_<MsMpEng pid>.log
+Get-Content C:\data\rsignal_<MsMpEng pid>.log
 ```
 
 The payload resolves the export at runtime, enlists all target threads in the
-Detours transaction, and installs the hook from a worker thread rather than
-from `DllMain`. It forwards arguments and the return value unchanged.
+Detours transaction (and keeps their suspended handles open until commit), and
+installs the hook from a worker thread rather than from `DllMain`. For every
+call it logs all four arguments, a hex+ASCII dump of `Context` and `Data`, and
+the return value. Arguments and return values are forwarded unchanged.
 
 Detours must make code pages writable. `--ppl` clears PPL and the
 block-non-Microsoft-binaries mitigation; `--allow-dynamic-code` clears
@@ -541,7 +543,7 @@ change. `allow-dynamic-code` should change the ACG line to `off`.
 | 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
 | 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
 | 15 | allow-dynamic-code | `query` shows `MitigationFlags1` bit 8 cleared; `clear` restores it together with any `allow-dlls` change |
-| 16 | Detours payload | `mpengine_hook.dll` logs `Detours hook installed` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; calls appear in `C:\data\mpengine_hook_<pid>.log` |
+| 16 | Detours payload | `mpengine_hook.dll` logs `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; calls and hex dumps appear in `C:\data\rsignal_<pid>.log` |
 
 ## Troubleshooting
 

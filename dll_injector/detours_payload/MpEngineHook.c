@@ -3,24 +3,25 @@
  *
  * This DLL is meant to be injected into a process that already has (or will
  * load) mpengine.dll, normally MsMpEng.exe. It installs a Microsoft Detours
- * inline hook on an exported mpengine function from a worker thread, so the
+ * inline hook on the exported __rsignal function from a worker thread, so the
  * loader lock is not held while Detours patches code.
  *
- * The example target is:
+ * Target:
  *
- *     mpengine.dll!MpContainerAnalyze(PVOID Context, PVOID Result) -> HRESULT
+ *     ULONG __rsignal(PVOID Context, int Signal, PVOID Data, int Flags)
  *
- * MpContainerAnalyze is called with a container/context object and a result
- * object. The hook only observes the call and forwards it to the real
- * function; it never changes arguments or the return value. Replace or extend
- * Hook_MpContainerAnalyze when you know which mpengine function you need.
+ * Every call is appended to:
+ *
+ *     C:\data\rsignal_<pid>.log
+ *
+ * Each entry contains all four arguments, a hex+ASCII dump of the Context
+ * pointer (RSI_CONTEXT_DUMP_BYTES), a hex+ASCII dump of the Data pointer
+ * (RSI_DATA_DUMP_BYTES), and the return value. The buffers are written before
+ * the real function runs, so the dump shows the data exactly as received.
  *
  * Build output: bin\<Configuration>\mpengine_hook.dll
  *
- * Log output:   C:\data\mpengine_hook_<pid>.log
- *
- * Injecting into MsMpEng.exe requires the MakeMePPL driver and the injector
- * options that clear PPL / block-non-Microsoft-binaries first:
+ * Injecting into MsMpEng.exe requires the MakeMePPL driver:
  *
  *     injector.exe MsMpEng.exe bin\Release\mpengine_hook.dll ^
  *         --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
@@ -50,24 +51,34 @@
 #pragma warning(pop)
 
 #define LOG_DIR             "C:\\data"
+#define LOG_FILE_PATTERN    LOG_DIR "\\rsignal_%lu.log"
 #define MPENGINE_DLL_NAME   "mpengine.dll"
 #define MPENGINE_DLL_WNAME  L"mpengine.dll"
 
 /*
  * The function to hook. It is a compile-time choice because the hook needs a
  * matching prototype. Override it with a project-wide preprocessor definition
- * if you add another typed hook.
+ * only together with the matching typedef/hook below.
  */
 #ifndef MPENGINE_HOOK_EXPORT
-#define MPENGINE_HOOK_EXPORT "MpContainerAnalyze"
+#define MPENGINE_HOOK_EXPORT "__rsignal"
 #endif
 
 #ifndef MPENGINE_MODULE_WAIT_MS
 #define MPENGINE_MODULE_WAIT_MS 30000
 #endif
 
-#ifndef MPENGINE_MAX_LOG_LINES
-#define MPENGINE_MAX_LOG_LINES 500
+/* How much memory to dump behind each pointer. */
+#ifndef RSI_CONTEXT_DUMP_BYTES
+#define RSI_CONTEXT_DUMP_BYTES 512
+#endif
+#ifndef RSI_DATA_DUMP_BYTES
+#define RSI_DATA_DUMP_BYTES 4096
+#endif
+
+/* Stop writing after this much data so a noisy engine cannot fill the disk. */
+#ifndef RSI_MAX_LOG_BYTES
+#define RSI_MAX_LOG_BYTES (64ull * 1024ull * 1024ull)
 #endif
 
 /* detours.h only defines this internally; it is a normal Win32 error code. */
@@ -75,60 +86,122 @@
 #define ERROR_DYNAMIC_CODE_BLOCKED 1655L
 #endif
 
-typedef HRESULT (WINAPI *PFN_MpContainerAnalyze)(PVOID Context, PVOID Result);
+/*
+ * __rsignal has four arguments on x64:
+ *   RCX = Context (in rsignal this is &DAT_18111e018)
+ *   EDX = Signal/event code (0x400a, 0x4019, 0x401c, ...)
+ *   R8  = Data pointer (meaning depends on the signal code)
+ *   R9D = Flags/size (used as a length in some branches)
+ *
+ * The decompiled return values are 32-bit status codes (0, 0x800e, 0x9003...).
+ */
+typedef ULONG (WINAPI *PFN___rsignal)(
+    PVOID Context,
+    int Signal,
+    PVOID Data,
+    int Flags);
 
-static PFN_MpContainerAnalyze g_RealMpContainerAnalyze = NULL;
-static volatile LONG         g_LogEnabled = 1;
-static volatile LONG         g_LogLines = 0;
-static volatile LONG         g_HookCalls = 0;
-static CRITICAL_SECTION      g_LogLock;
-static BOOLEAN               g_LogLockInitialized = FALSE;
+static PFN___rsignal g_Real__rsignal = NULL;
+static volatile LONG g_LogEnabled = 1;
+static volatile LONG g_HookCalls = 0;
+static CRITICAL_SECTION g_LogLock;
+static BOOLEAN g_LogLockInitialized = FALSE;
+static BOOLEAN g_LogLimitNoted = FALSE;
+static ULONGLONG g_LogBytes = 0;
+static __declspec(thread) LONG g_InHook = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Logging                                                                   */
 /* ------------------------------------------------------------------------- */
 
 static void
+WriteLogPrefixLocked(
+    _In_ FILE* File)
+{
+    SYSTEMTIME now;
+
+    GetLocalTime(&now);
+    fprintf(File,
+            "[%04u-%02u-%02u %02u:%02u:%02u.%03u] pid=%lu tid=%lu ",
+            now.wYear, now.wMonth, now.wDay,
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+            (unsigned long)GetCurrentProcessId(),
+            (unsigned long)GetCurrentThreadId());
+}
+
+static FILE*
+OpenLogLocked(void)
+{
+    char path[MAX_PATH];
+
+    if (!g_LogLockInitialized) {
+        return NULL;
+    }
+
+    CreateDirectoryA(LOG_DIR, NULL);
+    _snprintf_s(path, sizeof(path), _TRUNCATE,
+                LOG_FILE_PATTERN, (unsigned long)GetCurrentProcessId());
+
+    if (g_LogBytes >= RSI_MAX_LOG_BYTES) {
+        if (!g_LogLimitNoted) {
+            FILE* file;
+
+            g_LogLimitNoted = TRUE;
+            file = fopen(path, "a");
+            if (file != NULL) {
+                WriteLogPrefixLocked(file);
+                fprintf(file,
+                        "[!] log size limit (%llu bytes) reached; "
+                        "further calls are not logged\n",
+                        (unsigned long long)RSI_MAX_LOG_BYTES);
+                fclose(file);
+            }
+        }
+        return NULL;
+    }
+
+    return fopen(path, "a");
+}
+
+static void
+CloseLogLocked(
+    _In_ FILE* File)
+{
+    if (File == NULL) {
+        return;
+    }
+
+    {
+        __int64 size = _ftelli64(File);
+
+        if (size > 0) {
+            g_LogBytes += (ULONGLONG)size;
+        }
+    }
+    fclose(File);
+}
+
+static void
 LogV(
     _In_ const char* Format,
     _In_ va_list Arguments)
 {
-    char       message[1024];
-    char       path[MAX_PATH];
-    SYSTEMTIME now;
-    FILE*      file;
+    char  message[1024];
+    FILE* file;
 
-    if (!g_LogLockInitialized || g_LogLines >= MPENGINE_MAX_LOG_LINES) {
+    if (!g_LogLockInitialized) {
         return;
     }
 
     _vsnprintf_s(message, sizeof(message), _TRUNCATE, Format, Arguments);
 
     EnterCriticalSection(&g_LogLock);
-
-    if (g_LogLines >= MPENGINE_MAX_LOG_LINES) {
-        LeaveCriticalSection(&g_LogLock);
-        return;
-    }
-    ++g_LogLines;
-
-    GetLocalTime(&now);
-    _snprintf_s(path, sizeof(path), _TRUNCATE,
-                LOG_DIR "\\mpengine_hook_%lu.log",
-                (unsigned long)GetCurrentProcessId());
-
-    file = fopen(path, "a");
+    file = OpenLogLocked();
     if (file != NULL) {
-        fprintf(file,
-                "[%04u-%02u-%02u %02u:%02u:%02u.%03u] pid=%lu tid=%lu %s\n",
-                now.wYear, now.wMonth, now.wDay,
-                now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
-                (unsigned long)GetCurrentProcessId(),
-                (unsigned long)GetCurrentThreadId(),
-                message);
-        fclose(file);
+        WriteLogPrefixLocked(file);
+        fprintf(file, "%s\n", message);
+        CloseLogLocked(file);
     }
-
     LeaveCriticalSection(&g_LogLock);
 }
 
@@ -144,31 +217,148 @@ Log(
     va_end(arguments);
 }
 
+static void
+LogDump(
+    _In_ const char* Label,
+    _In_ const void* Address,
+    _In_ SIZE_T Bytes)
+{
+    BYTE  buffer[RSI_DATA_DUMP_BYTES];
+    SIZE_T read = 0;
+    SIZE_T i;
+    FILE* file;
+    MEMORY_BASIC_INFORMATION memoryInfo;
+    SIZE_T available;
+
+    if (Address == NULL) {
+        Log("%s: (null)", Label);
+        return;
+    }
+
+    if (Bytes == 0 || Bytes > sizeof(buffer)) {
+        Bytes = sizeof(buffer);
+    }
+
+    /*
+     * Do not ask ReadProcessMemory for bytes that cross into an uncommitted
+     * or guard page: it fails the whole request. Clamp to the region that is
+     * actually readable from Address.
+     */
+    if (VirtualQuery(Address, &memoryInfo, sizeof(memoryInfo)) == 0 ||
+        memoryInfo.State != MEM_COMMIT ||
+        (memoryInfo.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        Log("%s @ %p: unreadable (raw value 0x%p)",
+            Label, Address, Address);
+        return;
+    }
+
+    available = (SIZE_T)((const BYTE*)memoryInfo.BaseAddress +
+                         memoryInfo.RegionSize -
+                         (const BYTE*)Address);
+    if (Bytes > available) {
+        Bytes = available;
+    }
+    if (Bytes == 0) {
+        Log("%s @ %p: unreadable (raw value 0x%p)",
+            Label, Address, Address);
+        return;
+    }
+
+    if (!ReadProcessMemory(GetCurrentProcess(), Address, buffer, Bytes, &read) &&
+        read == 0) {
+        Log("%s @ %p: unreadable (raw value 0x%p)",
+            Label, Address, Address);
+        return;
+    }
+
+    EnterCriticalSection(&g_LogLock);
+    file = OpenLogLocked();
+    if (file != NULL) {
+        WriteLogPrefixLocked(file);
+        fprintf(file, "%s @ %p, %llu byte(s):\n",
+                Label, Address, (unsigned long long)read);
+
+        for (i = 0; i < read; i += 16) {
+            char   hex[16 * 3 + 1];
+            char   ascii[16 + 1];
+            SIZE_T count = read - i;
+            SIZE_T j;
+
+            if (count > 16) {
+                count = 16;
+            }
+
+            memset(hex, 0, sizeof(hex));
+            memset(ascii, 0, sizeof(ascii));
+
+            for (j = 0; j < count; ++j) {
+                BYTE value = buffer[i + j];
+
+                _snprintf_s(hex + j * 3, sizeof(hex) - j * 3, _TRUNCATE,
+                            "%02X ", value);
+                ascii[j] = (value >= 0x20 && value <= 0x7E)
+                               ? (char)value
+                               : '.';
+            }
+
+            fprintf(file, "    %04llX  %-47s  |%s|\n",
+                    (unsigned long long)i, hex, ascii);
+        }
+
+        CloseLogLocked(file);
+    }
+    LeaveCriticalSection(&g_LogLock);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Hook                                                                      */
 /* ------------------------------------------------------------------------- */
 
-static HRESULT WINAPI
-Hook_MpContainerAnalyze(
+static ULONG WINAPI
+Hook___rsignal(
     _In_ PVOID Context,
-    _In_ PVOID Result)
+    _In_ int Signal,
+    _In_ PVOID Data,
+    _In_ int Flags)
 {
-    PFN_MpContainerAnalyze real = g_RealMpContainerAnalyze;
-    HRESULT status;
-    LONG    call;
+    PFN___rsignal real = g_Real__rsignal;
+    ULONG status;
+    LONG  call;
 
     if (real == NULL) {
-        return E_FAIL;
+        return 0;
     }
 
-    status = real(Context, Result);
+    /*
+     * If a log write itself signals on this thread, forward without logging.
+     * A global log-size limit covers recursive calls from other threads.
+     */
+    if (InterlockedIncrement(&g_InHook) > 1) {
+        InterlockedDecrement(&g_InHook);
+        return real(Context, Signal, Data, Flags);
+    }
 
     call = InterlockedIncrement(&g_HookCalls);
-    if (g_LogEnabled && (call <= 10 || (call % 1000) == 0)) {
-        Log("MpContainerAnalyze(ctx=%p, result=%p) -> 0x%08lX (call %ld)",
-            Context, Result, (unsigned long)status, (long)call);
+
+    if (g_LogEnabled) {
+        Log("__rsignal(ctx=%p, signal=0x%X, data=%p, flags=0x%X (%d)) call=%ld",
+            Context, Signal, Data, (unsigned int)Flags, Flags, (long)call);
+        /*
+         * Dump before calling the real function: Data may point to a transient
+         * structure that the handler releases or rewrites.
+         */
+        LogDump("context", Context, RSI_CONTEXT_DUMP_BYTES);
+        LogDump("data", Data, RSI_DATA_DUMP_BYTES);
     }
 
+    status = real(Context, Signal, Data, Flags);
+
+    if (g_LogEnabled) {
+        Log("__rsignal -> 0x%08lX (call=%ld)",
+            (unsigned long)status, (long)call);
+    }
+
+    InterlockedDecrement(&g_InHook);
     return status;
 }
 
@@ -200,9 +390,17 @@ WaitForModule(
  * Tell Detours about every thread in this process before committing. Without
  * this, a thread that is currently executing inside the function being
  * patched can execute a half-written prologue while Detours updates it.
+ *
+ * DetourUpdateThread suspends each thread and stores the handle for the
+ * transaction; the commit (or abort) resumes it. The caller must therefore
+ * keep these handles open until the transaction has finished.
  */
-static void
-EnlistProcessThreads(void)
+#define MAX_ENLISTED_THREADS 4096
+
+static DWORD
+EnlistProcessThreads(
+    _Out_writes_to_(Capacity, return) HANDLE* Handles,
+    _In_ DWORD Capacity)
 {
     HANDLE        snapshot;
     THREADENTRY32 entry;
@@ -210,15 +408,12 @@ EnlistProcessThreads(void)
     DWORD         enlisted = 0;
     DWORD         skipped = 0;
 
-    (void)DetourUpdateThread(GetCurrentThread());
-    ++enlisted;
-
     snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         Log("[!] CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed: %lu; "
-            "only the hook thread is enlisted",
+            "only the current thread is covered",
             (unsigned long)GetLastError());
-        return;
+        return 0;
     }
 
     entry.dwSize = sizeof(entry);
@@ -228,6 +423,10 @@ EnlistProcessThreads(void)
 
             if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
                 entry.th32ThreadID == self) {
+                continue;
+            }
+            if (enlisted >= Capacity) {
+                ++skipped;
                 continue;
             }
 
@@ -243,17 +442,30 @@ EnlistProcessThreads(void)
             }
 
             if (DetourUpdateThread(thread) == NO_ERROR) {
-                ++enlisted;
+                Handles[enlisted++] = thread;
             } else {
+                CloseHandle(thread);
                 ++skipped;
             }
-            CloseHandle(thread);
         } while (Thread32Next(snapshot, &entry));
     }
 
     CloseHandle(snapshot);
     Log("[*] Detours enlisted %lu thread(s), skipped %lu",
         (unsigned long)enlisted, (unsigned long)skipped);
+    return enlisted;
+}
+
+static void
+ReleaseThreadHandles(
+    _In_reads_(Count) HANDLE* Handles,
+    _In_ DWORD Count)
+{
+    DWORD i;
+
+    for (i = 0; i < Count; ++i) {
+        CloseHandle(Handles[i]);
+    }
 }
 
 static DWORD WINAPI
@@ -263,6 +475,8 @@ InstallHooksThread(
     HMODULE engine;
     LONG    error;
     char    host[MAX_PATH] = { 0 };
+    HANDLE  threadHandles[MAX_ENLISTED_THREADS];
+    DWORD   threadCount = 0;
 
     (void)Parameter;
 
@@ -287,9 +501,9 @@ InstallHooksThread(
     }
     Log("[+] %s @ 0x%p", MPENGINE_DLL_NAME, (void*)engine);
 
-    g_RealMpContainerAnalyze = (PFN_MpContainerAnalyze)
+    g_Real__rsignal = (PFN___rsignal)
         GetProcAddress(engine, MPENGINE_HOOK_EXPORT);
-    if (g_RealMpContainerAnalyze == NULL) {
+    if (g_Real__rsignal == NULL) {
         Log("[!] export %s!%s not found: %lu",
             MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
             (unsigned long)GetLastError());
@@ -297,7 +511,7 @@ InstallHooksThread(
     }
     Log("[+] target %s!%s @ 0x%p",
         MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
-        (void*)g_RealMpContainerAnalyze);
+        (void*)g_Real__rsignal);
 
     error = DetourTransactionBegin();
     if (error != NO_ERROR) {
@@ -305,18 +519,20 @@ InstallHooksThread(
         return 0;
     }
 
-    EnlistProcessThreads();
+    threadCount = EnlistProcessThreads(threadHandles, MAX_ENLISTED_THREADS);
 
-    error = DetourAttach((PVOID*)&g_RealMpContainerAnalyze,
-                         (PVOID)Hook_MpContainerAnalyze);
+    error = DetourAttach((PVOID*)&g_Real__rsignal,
+                         (PVOID)Hook___rsignal);
     if (error != NO_ERROR) {
         Log("[!] DetourAttach(%s) failed: %ld", MPENGINE_HOOK_EXPORT,
             (long)error);
         (void)DetourTransactionAbort();
+        ReleaseThreadHandles(threadHandles, threadCount);
         return 0;
     }
 
     error = DetourTransactionCommit();
+    ReleaseThreadHandles(threadHandles, threadCount);
     if (error != NO_ERROR) {
         Log("[!] DetourTransactionCommit failed: %ld (Win32 %lu)",
             (long)error, (unsigned long)GetLastError());
@@ -333,7 +549,7 @@ InstallHooksThread(
     InterlockedExchange(&g_LogEnabled, 1);
     Log("[+] Detours hook installed: %s!%s -> 0x%p",
         MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
-        (void*)Hook_MpContainerAnalyze);
+        (void*)Hook___rsignal);
     return 0;
 }
 

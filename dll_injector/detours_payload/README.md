@@ -2,23 +2,40 @@
 
 `mpengine_hook.dll` is a Microsoft Detours payload for the existing
 `dll_injector`. Load it into `MsMpEng.exe` after the MakeMePPL driver clears
-PPL, and it installs an inline hook on an exported `mpengine.dll` function.
+PPL, and it installs an inline hook on `mpengine.dll!__rsignal`.
 
-The example target is:
+Target:
 
 ```c
-HRESULT MpContainerAnalyze(PVOID Context, PVOID Result);
+ULONG __rsignal(PVOID Context, int Signal, PVOID Data, int Flags);
 ```
 
-The hook calls the real function with unchanged arguments, logs the call, and
-returns its result. Nothing is blocked or modified.
+Every call is dumped to:
+
+```text
+C:\data\rsignal_<pid>.log
+```
+
+The hook forwards all arguments and the return value unchanged. It does not
+block or modify anything. For each call the log contains:
+
+1. All four arguments: `Context`, `Signal` (hex), `Data`, and `Flags` (hex and
+   decimal), plus a monotonic call number.
+2. A hex + ASCII dump of `Context` (default 512 bytes).
+3. A hex + ASCII dump of `Data` (default 4096 bytes, clamped to the committed
+   region so guard pages are not touched).
+4. The return value.
+
+The dump is taken **before** the real function runs, so it captures the data
+exactly as received.
 
 | Output | Source | Notes |
 |---|---|---|
 | `bin\<Configuration>\mpengine_hook.dll` | `MpEngineHook.c` | Detours payload |
 | `bin\<Configuration>\detours.lib` | `..\..\third_party\detours` | Detours, built from source |
 
-Log: `C:\data\mpengine_hook_<pid>.log`
+The payload stops writing after `RSI_MAX_LOG_BYTES` (64 MB by default) and
+notes the limit once in the log.
 
 ## Build
 
@@ -61,14 +78,14 @@ The flow is the same as for any payload:
 2. `--allow-dynamic-code` clears ACG / `DisableDynamicCode`.
 3. `--fix-handle` repairs access stripped by Defender self-protection.
 4. `--kernel-thread` creates the remote `LoadLibraryW` thread from kernel mode.
-5. The payload's worker thread waits for `mpengine.dll`, resolves
-   `MpContainerAnalyze`, and commits the Detours transaction.
+5. The payload's worker thread waits for `mpengine.dll`, resolves `__rsignal`,
+   and commits the Detours transaction.
 6. `--restore` puts PPL, ACG and the signature mitigation back.
 
 Verify:
 
 ```powershell
-Get-Content C:\data\mpengine_hook_<MsMpEng pid>.log
+Get-Content C:\data\rsignal_<MsMpEng pid>.log
 .\bin\Release\PplCtl.exe query --pid <MsMpEng pid>
 ```
 
@@ -76,31 +93,43 @@ A successful install logs:
 
 ```text
 [+] mpengine.dll @ 0x...
-[+] target mpengine.dll!MpContainerAnalyze @ 0x...
+[+] target mpengine.dll!__rsignal @ 0x...
 [*] Detours enlisted N thread(s), skipped 0
-[+] Detours hook installed: mpengine.dll!MpContainerAnalyze -> 0x...
+[+] Detours hook installed: mpengine.dll!__rsignal -> 0x...
 ```
 
-`MpContainerAnalyze` is called by the scan/container path. To force engine
-activity, run a scan with `MpCmdRun.exe -Scan -ScanType 1` or open a folder
-Defender inspects. The first ten calls and then every 1000th are logged, so a
-busy engine does not fill `C:\data` with I/O.
+After that each call starts with:
+
+```text
+__rsignal(ctx=..., signal=0x4019, data=..., flags=0x10 (16)) call=1
+context @ ..., 512 byte(s):
+    0000  44 33 22 11 ...  |D3".............|
+data @ ..., 976 byte(s):
+    0000  EF BE AD DE ...  |....hello from f|
+__rsignal -> 0x0000800E (call=1)
+```
+
+`__rsignal` is a signal/event dispatcher used by the engine. To generate
+activity, run a scan with `MpCmdRun.exe -Scan -ScanType 1` or perform actions
+that make Defender inspect files.
 
 ## Changing the hook
 
 The hook prototype and export name are compile-time constants:
 
-- `MPENGINE_HOOK_EXPORT` in `MpEngineHook.c` (default `MpContainerAnalyze`).
-- `PFN_MpContainerAnalyze`, `Hook_MpContainerAnalyze`, and the
-  `DetourAttach` call in `InstallHooksThread`.
+- `MPENGINE_HOOK_EXPORT` in `MpEngineHook.c` (default `__rsignal`).
+- `PFN___rsignal`, `Hook___rsignal`, and the `DetourAttach` call in
+  `InstallHooksThread`.
+- Dump sizes and the log limit: `RSI_CONTEXT_DUMP_BYTES`,
+  `RSI_DATA_DUMP_BYTES`, `RSI_MAX_LOG_BYTES`.
 
 For a different function, add the matching typedef and hook body, then change
 the `DetourAttach` target. Keep the real-function pointer updated by
 `DetourAttach`; the hook must forward to it.
 
 `mpengine.dll` only exports a small named surface (`MpBootStrap`,
-`MpContainer*`, `GetSigFiles`, ...). For an internal, non-exported function,
-resolve it with a signature/pattern scan and pass that address to
+`MpContainer*`, `__rsignal`, `rsignal`, ...). For an internal, non-exported
+function, resolve it with a signature/pattern scan and pass that address to
 `DetourAttach`; the rest of the transaction is unchanged.
 
 ## Removing the hook
