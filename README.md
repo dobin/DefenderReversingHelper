@@ -3,12 +3,19 @@
 A test-signed Windows driver and CLI that grant: 
 * **Protected Process Light (PPL)** to a process by PID, name filter, or named-pipe connection.
 * Remove the **block non-Microsoft binaries** process mitigation of processes
+* Clear **Arbitrary Code Guard (ACG)** so an in-process Detours hook can patch code
 * DLL inject into `MsMpEng.exe`
 
 It ships a DLL injector, `bin\Release\injector.exe`, with driver-backed
-`--ppl`, `--fix-handle`, and `--kernel-thread` options. Together they can load
-a DLL into a protected process such as `MsMpEng.exe`. See
-[dll_injector](dll_injector/README.md) for usage and caveats.
+`--ppl`, `--allow-dynamic-code`, `--fix-handle`, and `--kernel-thread` options.
+Together they can load a DLL into a protected process such as `MsMpEng.exe`.
+See [dll_injector](dll_injector/README.md) for usage and caveats.
+
+It also ships `bin\Release\mpengine_hook.dll`, a Microsoft Detours payload that
+hooks `mpengine.dll!MpContainerAnalyze` from inside the target. Detours is
+compiled from its source checkout (`C:\Repos\Detours` by default). Use
+`--allow-dynamic-code` in addition to `--ppl` when the target has ACG. See
+[dll_injector/detours_payload](dll_injector/detours_payload/README.md).
 
 The purpose is to enable AI agents to start tools as PPL. 
 
@@ -26,6 +33,8 @@ Based on the initial [MakeMePPL](https://github.com/dobin/MakeMePPL) tool.
 - Windows x64 test VM; Windows 11 24H2/25H2 is the tested target.
 - Visual Studio 2022: **Desktop development with C++** workload.
 - Windows SDK and WDK **10.0.26100.0**, including `WindowsKernelModeDriver10.0`.
+- A Microsoft Detours source checkout at `C:\Repos\Detours`, or pass
+  `-DetoursDir <path>` / set `DETOURS_DIR`.
 - **Secure Boot off**, **HVCI / memory integrity off** in the test VM.
 - Elevated PowerShell for setup and cleanup. Run commands from the repository root.
 
@@ -64,6 +73,9 @@ $target = Start-Process .\bin\Release\test_target.exe -PassThru
 
 # Remove the blockdll mitigation so the target can load unsigned DLLs
 .\bin\Release\PplCtl.exe allow-dlls --pid $target.Id
+
+# Clear ACG so an in-process Detours hook can modify code pages
+.\bin\Release\PplCtl.exe allow-dynamic-code --pid $target.Id
 ```
 
 `query` should show `0x31`;
@@ -89,10 +101,20 @@ loaded:
 ```
 
 `--ppl` clears PPL and the blockdll mitigation before `OpenProcess`;
+`--allow-dynamic-code` also clears ACG (needed by the Detours payload);
 `--fix-handle` repairs access stripped by Defender self-protection;
 `--kernel-thread` creates the remote thread from kernel mode; `--restore`
 puts the original protection back afterwards. See
 [dll_injector/README.md](dll_injector/README.md).
+
+To hook `mpengine.dll!MpContainerAnalyze` from inside the engine, inject the
+Detours payload instead:
+
+```powershell
+.\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
+    --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
+Get-Content C:\data\mpengine_hook_<MsMpEng pid>.log
+```
 
 For name filters, the on-connect broker, other signers, and all CLI options, see the
 [command reference and examples](GUIDE.md#quick-start).

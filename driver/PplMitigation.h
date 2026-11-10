@@ -14,6 +14,15 @@ NTSTATUS PplAllowNonMicrosoftDllsByPid(
     _Out_ PPPL_MITIGATION_RESULT Result);
 
 //
+// Clears ACG (MitigationFlags1 bit 8, DisableDynamicCode) so a Detours payload
+// can patch image code pages. Tracked like allow-dlls; restore is handled by
+// IOCTL_PPL_CLEAR_BY_PID / driver unload.
+//
+NTSTATUS PplAllowDynamicCodeByPid(
+    _In_ ULONG ProcessId,
+    _Out_ PPPL_MITIGATION_RESULT Result);
+
+//
 // Restores the mitigation fields of a tracked entry. The caller must hold the
 // track lock. Returns FALSE if the current values no longer match what this
 // driver applied, or if the write-back did not verify.

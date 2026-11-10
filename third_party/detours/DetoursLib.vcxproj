@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}</ProjectGuid>
+    <RootNamespace>DetoursLib</RootNamespace>
+    <ProjectName>DetoursLib</ProjectName>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+  </PropertyGroup>
+
+  <!--
+    Microsoft Detours is not vendored into this repository. Point DetoursDir at a
+    Detours source checkout (https://github.com/microsoft/Detours). Override it on
+    the command line with /p:DetoursDir=C:\path\to\Detours or set DETOURS_DIR.
+  -->
+  <PropertyGroup Label="Detours">
+    <DetoursDir Condition="'$(DetoursDir)' == '' and '$(DETOURS_DIR)' != ''">$(DETOURS_DIR)</DetoursDir>
+    <DetoursDir Condition="'$(DetoursDir)' == ''">C:\Repos\Detours</DetoursDir>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Configuration)\</IntDir>
+    <TargetName>detours</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ConformanceMode>true</ConformanceMode>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(DetoursDir)\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreadedDLL</RuntimeLibrary>
+      <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DisableSpecificWarnings>4267;4244;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="$(DetoursDir)\src\detours.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\modules.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disasm.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\image.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\creatwth.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disolx86.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disolx64.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disolia64.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disolarm.cpp" />
+    <ClCompile Include="$(DetoursDir)\src\disolarm64.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="$(DetoursDir)\src\detours.h" />
+    <ClInclude Include="$(DetoursDir)\src\detver.h" />
+  </ItemGroup>
+
+  <!-- Fail with an actionable message instead of a wall of missing-file errors. -->
+  <Target Name="CheckDetoursDir" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(DetoursDir)\src\detours.cpp')"
+           Text="Detours sources were not found under '$(DetoursDir)'. Clone https://github.com/microsoft/Detours or build with /p:DetoursDir=C:\path\to\Detours." />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

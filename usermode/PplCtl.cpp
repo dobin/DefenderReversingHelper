@@ -35,6 +35,7 @@ PrintUsage()
         L"  pplctl query --pid <pid>\n"
         L"  pplctl probe --pid <pid>\n"
         L"  pplctl allow-dlls --pid <pid>\n"
+        L"  pplctl allow-dynamic-code --pid <pid>\n"
         L"  pplctl filter add    --name <pattern> [--signer <name>] [--audit] [--exact] [--apply-existing]\n"
         L"  pplctl filter remove --name <pattern>\n"
         L"  pplctl filter clear\n"
@@ -47,6 +48,8 @@ PrintUsage()
         L"Default signer is antimalware (PPL-Antimalware, protection byte 0x31).\n"
         L"allow-dlls removes the block-non-Microsoft-binaries mitigation (Cobalt Strike blockdll,\n"
         L"PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) so the target can load unsigned DLLs.\n"
+        L"allow-dynamic-code clears ACG (DisableDynamicCode) so an in-process Detours payload can\n"
+        L"make image code pages writable. Both changes are tracked for clear/restore.\n"
         L"clear --force removes PPL from a process this driver did not protect; the byte is\n"
         L"tracked, so set+clear restores it. Use only in an isolated test VM.\n"
         L"Driver installation/removal requires an elevated console; pplctl commands work for any local user.\n"
@@ -457,6 +460,77 @@ CommandAllowDlls(int argc, wchar_t** argv)
 }
 
 int
+AllowDynamicCode(
+    _In_ ULONG ProcessId)
+{
+    PPL_MITIGATION_REQUEST request = {};
+    PPL_MITIGATION_RESULT result = {};
+    HANDLE device;
+    DWORD returned = 0;
+
+    request.ProcessId = ProcessId;
+
+    device = PplOpenDevice();
+    if (device == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+
+    BOOL ok = PplIoctl(device, IOCTL_PPL_ALLOW_DYNAMIC_CODE,
+                       &request, sizeof(request),
+                       &result, sizeof(result), &returned);
+    CloseHandle(device);
+    if (!ok) {
+        return 1;
+    }
+
+    std::wprintf(L"allow-dynamic-code pid %lu: %s (0x%08lX)\n",
+                 ProcessId,
+                 PplNtStatusText(result.Status).c_str(),
+                 static_cast<unsigned long>(result.Status));
+
+    if (PplNtSuccess(result.Status)) {
+        std::wprintf(L"  MitigationFlags1: 0x%08lX -> 0x%08lX%s\n",
+                     static_cast<unsigned long>(result.OldMitigationFlags1),
+                     static_cast<unsigned long>(result.NewMitigationFlags1),
+                     (result.OldMitigationFlags1 == result.NewMitigationFlags1)
+                         ? L" (already clear)"
+                         : L"");
+        std::wprintf(L"  MitigationFlags2: 0x%08lX -> 0x%08lX (unchanged)\n",
+                     static_cast<unsigned long>(result.OldMitigationFlags2),
+                     static_cast<unsigned long>(result.NewMitigationFlags2));
+    }
+
+    return PplNtSuccess(result.Status) ? 0 : 1;
+}
+
+int
+CommandAllowDynamicCode(int argc, wchar_t** argv)
+{
+    ULONG processId = 0;
+    bool havePid = false;
+
+    for (int i = 2; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
+            havePid = ParseUlong(argv[++i], &processId);
+            if (!havePid) {
+                std::fwprintf(stderr, L"Invalid --pid value.\n");
+                return 2;
+            }
+        } else {
+            std::fwprintf(stderr, L"Unknown option '%s'.\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (!havePid) {
+        std::fwprintf(stderr, L"allow-dynamic-code requires --pid <pid>.\n");
+        return 2;
+    }
+
+    return AllowDynamicCode(processId);
+}
+
+int
 CommandSet(int argc, wchar_t** argv)
 {
     ULONG processId = 0;
@@ -676,6 +750,11 @@ CommandQuery(int argc, wchar_t** argv)
                      static_cast<unsigned long>(result.MitigationFlags2));
         std::wprintf(L"  block non-MS DLLs: %s\n",
                      (result.Flags & PPL_QUERY_FLAG_BLOCK_NON_MS_DLLS)
+                         ? L"ON"
+                         : L"off");
+        std::wprintf(L"  ACG (dynamic code): %s\n",
+                     (result.MitigationFlags1 &
+                      PPL_MITIGATION_FLAG_DISABLE_DYNAMIC_CODE)
                          ? L"ON"
                          : L"off");
         std::wprintf(L"  PsIsProtectedProcess     : %s\n",
@@ -1287,6 +1366,9 @@ wmain(
     }
     if (_wcsicmp(argv[1], L"allow-dlls") == 0) {
         return CommandAllowDlls(argc, argv);
+    }
+    if (_wcsicmp(argv[1], L"allow-dynamic-code") == 0) {
+        return CommandAllowDynamicCode(argc, argv);
     }
     if (_wcsicmp(argv[1], L"query") == 0) {
         return CommandQuery(argc, argv);

@@ -25,6 +25,9 @@ Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/K
 - **DLL signature mitigation:** `pplctl allow-dlls --pid <pid>` removes the
   `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` / Cobalt Strike `blockdll` restriction so the
   target can load unsigned DLLs
+- **ACG for hooking:** `pplctl allow-dynamic-code --pid <pid>` clears
+  `ProcessDynamicCodePolicy` so an in-process Detours payload can patch image code
+  pages; both mitigation changes are tracked for restore
 - **Name filter:** a process-creation callback protects every new image whose base name
   matches a pattern (protection is applied by a deferred driver thread shortly after
   creation); `--apply-existing` handles already-running processes
@@ -69,6 +72,13 @@ ppl_executor/
     payload/
       DllPayload.vcxproj
       payload.c                  outputs payload.dll (writes C:\data marker)
+    detours_payload/
+      MpEngineHook.vcxproj
+      MpEngineHook.c             outputs mpengine_hook.dll (Detours hook)
+      README.md                  hook target, log, ACG caveat
+  third_party/detours/
+    DetoursLib.vcxproj           builds detours.lib from C:\Repos\Detours
+    README.md                    Detours source location / override
   scripts/
     Build.ps1
     New-TestCert.ps1
@@ -120,7 +130,13 @@ bin\Release\PplCtl.exe
 bin\Release\test_target.exe
 bin\Release\injector.exe
 bin\Release\payload.dll
+bin\Release\mpengine_hook.dll
+bin\Release\detours.lib
 ```
+
+Detours is compiled from `C:\Repos\Detours` unless `-DetoursDir <path>`,
+`DETOURS_DIR`, or `/p:DetoursDir=...` points elsewhere. If the checkout is
+missing, the build stops with an explicit error.
 
 The driver is linked with `/INTEGRITYCHECK` in both configurations. Verify it:
 
@@ -206,6 +222,9 @@ elevated if you want it to enable `SeDebugPrivilege`.
 
 # Remove the block-non-Microsoft-binaries mitigation (blockdll)
 .\bin\Release\PplCtl.exe allow-dlls --pid <pid>
+
+# Clear ACG so an in-process Detours hook can patch code pages
+.\bin\Release\PplCtl.exe allow-dynamic-code --pid <pid>
 ```
 
 `allow-dlls` clears `EPROCESS!MitigationFlags` bit 23 (`SignatureMitigationOptIn`) and
@@ -215,6 +234,9 @@ processes created with `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` /
 `PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` and on
 processes that enabled `SetProcessMitigationPolicy(ProcessSignaturePolicy,
 MicrosoftSignedOnly=1)` at runtime.
+
+`allow-dynamic-code` clears `MitigationFlags` bit 8 (`DisableDynamicCode`, ACG). It is
+also tracked, and `clear --pid` restores it together with any `allow-dlls` change.
 
 Protect every new `test_` image automatically:
 
@@ -273,6 +295,7 @@ $target = Start-Process .\bin\Release\test_target.exe -PassThru
 | Option | Effect |
 |---|---|
 | `--ppl` | Before `OpenProcess`, force-clear PPL (`IOCTL_PPL_FORCE_CLEAR_BY_PID`) and clear the block-non-Microsoft-binaries mitigation (`IOCTL_PPL_ALLOW_NON_MS_DLLS`). Both changes are tracked by the driver. |
+| `--allow-dynamic-code` | Clear ACG (`IOCTL_PPL_ALLOW_DYNAMIC_CODE`); needed for Detours to make image code pages writable. Tracked. |
 | `--fix-handle` | Restore `GrantedAccess` that Defender self-protection stripped from the `OpenProcess` handle (`IOCTL_PPL_FIX_HANDLE_ACCESS`). |
 | `--kernel-thread` | Create the remote thread from kernel mode via `RtlCreateUserThread` (`IOCTL_PPL_CREATE_REMOTE_THREAD`), bypassing the user-mode protected-process check. |
 | `--restore` | After injection, restore the original protection/mitigation (`IOCTL_PPL_CLEAR_BY_PID`). Only meaningful with `--ppl`. |
@@ -285,6 +308,29 @@ thread-creation rights. Run the injector elevated when targeting `MsMpEng.exe`:
 after PPL is cleared the process is still a SYSTEM process. Without `--restore`,
 run `pplctl clear --pid <pid>` to put the tracked protection back. See
 [dll_injector/README.md](dll_injector/README.md) for details and limitations.
+
+### Detours hook payload
+
+`bin\Release\mpengine_hook.dll` is a Microsoft Detours payload. Its example
+hook is `mpengine.dll!MpContainerAnalyze`:
+
+```powershell
+.\bin\Release\injector.exe MsMpEng.exe .\bin\Release\mpengine_hook.dll `
+    --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
+Get-Content C:\data\mpengine_hook_<MsMpEng pid>.log
+```
+
+The payload resolves the export at runtime, enlists all target threads in the
+Detours transaction, and installs the hook from a worker thread rather than
+from `DllMain`. It forwards arguments and the return value unchanged.
+
+Detours must make code pages writable. `--ppl` clears PPL and the
+block-non-Microsoft-binaries mitigation; `--allow-dynamic-code` clears
+**Arbitrary Code Guard** (`ProcessDynamicCodePolicy`). If ACG is still active,
+the commit fails with `ERROR_DYNAMIC_CODE_BLOCKED` (1655), which the payload
+records in its log. See
+[dll_injector/detours_payload/README.md](dll_injector/detours_payload/README.md)
+for changing the hook target and more caveats.
 
 ## Cleanup
 
@@ -331,6 +377,7 @@ pplctl clear --pid <pid>
 pplctl query --pid <pid>
 pplctl probe --pid <pid>
 pplctl allow-dlls --pid <pid>
+pplctl allow-dynamic-code --pid <pid>
 pplctl filter add    --name <pattern> [--signer <name>] [--audit] [--exact] [--apply-existing]
 pplctl filter remove --name <pattern>
 pplctl filter clear
@@ -340,7 +387,7 @@ pplctl connect [--pipe PplGrant] [--hold <seconds>]
 pplctl builds
 pplctl version
 
-injector <pid|image name> <full\path\to\payload.dll> [--ppl] [--fix-handle] [--kernel-thread] [--restore]
+injector <pid|image name> <full\path\to\payload.dll> [--ppl] [--allow-dynamic-code] [--fix-handle] [--kernel-thread] [--restore]
 ```
 
 `builds` prints the build table compiled into `pplctl`, marks the running OS, and
@@ -365,9 +412,10 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 `GetProcessInformation(ProcessProtectionLevelInfo)` to show the user-mode view.
 
 `query` also reports `SignatureLevel`, `SectionSignatureLevel`, the raw
-`MitigationFlags1`/`MitigationFlags2`, and `block non-MS DLLs: ON/off`.
-`allow-dlls` should change that line to `off`; `Get-ProcessMitigation` reports
-`MicrosoftSignedOnly: OFF` after the change.
+`MitigationFlags1`/`MitigationFlags2`, `block non-MS DLLs: ON/off`, and
+`ACG (dynamic code): ON/off`. `allow-dlls` should change the blockdll line to
+`off`; `Get-ProcessMitigation` reports `MicrosoftSignedOnly: OFF` after the
+change. `allow-dynamic-code` should change the ACG line to `off`.
 
 `probe` enables `SeDebugPrivilege` first, then tests:
 
@@ -386,8 +434,9 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   `KDUGetEprocessOffsets` and `PsProtectionOffset_*` constants. `PS_PROTECTION` is
   `0x87A` for 19041-22631 and `0x5FA` for 26100-26200, among others. The table also
   records `MitigationFlags` and `ObjectTable` offsets. `PS_PROTECTION` is used for PPL;
-  `MitigationFlags1` is used by `allow-dlls`. Unknown builds (including 26H1/26H2, which
-  KDU does not map yet) load but `SET`/`FILTER`/`ALLOW-DLLS` return
+  `MitigationFlags1` is used by `allow-dlls` and `allow-dynamic-code`. Unknown builds
+  (including 26H1/26H2, which KDU does not map yet) load but
+  `SET`/`FILTER`/`ALLOW-DLLS`/`ALLOW-DYNAMIC-CODE` return
   `STATUS_NOT_SUPPORTED`; the driver never guesses or scans for the field.
 - **Protection byte.** PPL is set by writing only `PS_PROTECTION`. The driver does not
   change `SignatureLevel`/`SectionSignatureLevel` for a PPL grant.
@@ -397,6 +446,12 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   `SectionSignatureLevel` to 8 (Microsoft). `allow-dlls` clears bit 23 and zeroes
   `SectionSignatureLevel`; it leaves `SignatureLevel` (the process image's own signing
   level) and `MitigationFlags2` alone. Both writes are verified.
+- **ACG.** `allow-dynamic-code` clears `MitigationFlags1` bit 8
+  (`DisableDynamicCode` / `ProcessDynamicCodePolicy`). Without it, a Detours payload
+  cannot flip `mpengine` image code pages to writable and commit fails with
+  `ERROR_DYNAMIC_CODE_BLOCKED` (1655). The write is verified and tracked; if
+  `allow-dlls` already tracked the process, the entry keeps the original flags and both
+  changes restore together.
 - **Verification.** For PPL the driver reads the byte back and checks
   `PsIsProtectedProcess`/`PsIsProtectedProcessLight` for type 0, 1, or 2. On a signer-only
   change the boolean checks cannot distinguish signers, so the byte readback is the limit
@@ -409,8 +464,8 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 - **Clear safety.** `clear` refuses to remove protection from an untracked process whose
   current byte is non-zero. This avoids accidentally stripping PPL from Defender, LSA, or
   a process protected by a previous driver load. A mitigation-only entry (created by
-  `allow-dlls`) always has a non-zero change mask, so `clear` restores the mitigation and
-  leaves the protection byte untouched.
+  `allow-dlls` or `allow-dynamic-code`) always has a non-zero change mask, so `clear`
+  restores the mitigation and leaves the protection byte untouched.
 - **Restore.** On normal `clear` or unload, the original values are written only if the
   current values still match what this driver applied. PID-reused or externally changed
   processes are skipped. A driver crash or forced unload can leave processes PPL (or with
@@ -445,6 +500,10 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
   mitigation from the target, so any unsigned DLL can load. The change is tracked and
   restored by `clear --pid` or driver unload, but a crash or forced unload leaves the
   target permissive until it exits or the machine reboots. Use only on a test target.
+- **`allow-dynamic-code` weakens exploit mitigation.** It disables ACG in the target,
+  allowing code pages to be made writable. An injected Detours payload then works, but
+  so does any other in-process code modification. The change is tracked like
+  `allow-dlls`; restore it with `--restore` / `clear --pid` when done.
 - **Existing handles are not revoked.** If another process already has a full-access
   handle when the target becomes PPL, that handle may remain usable. Applying protection
   in the creation callback is stronger than PID/on-connect because fewer handles exist.
@@ -481,6 +540,8 @@ the `PsIsProtectedProcess` / `PsIsProtectedProcessLight` flags. It also uses
 | 12 | Stability | Many matching create/exit cycles; no bugcheck; reboot clears state |
 | 13 | allow-dlls | `target_hardened.exe` (MicrosoftSignedOnly) accepts an unsigned DLL after `allow-dlls`; `query` shows `block non-MS DLLs: off`; `clear` restores it |
 | 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
+| 15 | allow-dynamic-code | `query` shows `MitigationFlags1` bit 8 cleared; `clear` restores it together with any `allow-dlls` change |
+| 16 | Detours payload | `mpengine_hook.dll` logs `Detours hook installed` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; calls appear in `C:\data\mpengine_hook_<pid>.log` |
 
 ## Troubleshooting
 

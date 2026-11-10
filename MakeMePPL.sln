@@ -12,6 +12,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DllInjector", "dll_injector
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DllPayload", "dll_injector\payload\DllPayload.vcxproj", "{A94E129F-85FF-4E96-8F46-973FFA06FBB2}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DetoursLib", "third_party\detours\DetoursLib.vcxproj", "{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MpEngineHook", "dll_injector\detours_payload\MpEngineHook.vcxproj", "{C2B1A643-5D6E-4F21-8C3B-7A9D0E4F8B52}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -38,6 +42,14 @@ Global
 		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Debug|x64.Build.0 = Debug|x64
 		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Release|x64.ActiveCfg = Release|x64
 		{A94E129F-85FF-4E96-8F46-973FFA06FBB2}.Release|x64.Build.0 = Release|x64
+		{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}.Debug|x64.ActiveCfg = Debug|x64
+		{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}.Debug|x64.Build.0 = Debug|x64
+		{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}.Release|x64.ActiveCfg = Release|x64
+		{6F3E2E4A-7B3D-4E6A-9E2F-1C2D3E4F5A61}.Release|x64.Build.0 = Release|x64
+		{C2B1A643-5D6E-4F21-8C3B-7A9D0E4F8B52}.Debug|x64.ActiveCfg = Debug|x64
+		{C2B1A643-5D6E-4F21-8C3B-7A9D0E4F8B52}.Debug|x64.Build.0 = Debug|x64
+		{C2B1A643-5D6E-4F21-8C3B-7A9D0E4F8B52}.Release|x64.ActiveCfg = Release|x64
+		{C2B1A643-5D6E-4F21-8C3B-7A9D0E4F8B52}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

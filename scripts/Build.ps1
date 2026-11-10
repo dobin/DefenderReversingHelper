@@ -4,7 +4,11 @@ param(
     [string]$Configuration = 'Release',
 
     [ValidateSet('x64')]
-    [string]$Platform = 'x64'
+    [string]$Platform = 'x64',
+
+    # Optional path to a Microsoft Detours source checkout. The projects
+    # default to C:\Repos\Detours or the DETOURS_DIR environment variable.
+    [string]$DetoursDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,11 +64,25 @@ if (-not (Test-Path $DriverToolset)) {
 Write-Host "MSBuild : $MSBuild"
 Write-Host "WDK     : $kitsRoot"
 Write-Host "Config  : $Configuration|$Platform"
+if ($DetoursDir) {
+    Write-Host "Detours : $DetoursDir"
+}
 Write-Host ''
 
-& $MSBuild $Solution /m /nologo /v:minimal `
-    "/p:Configuration=$Configuration" `
+$MSBuildArgs = @(
+    $Solution,
+    '/m',
+    '/nologo',
+    '/v:minimal',
+    "/p:Configuration=$Configuration",
     "/p:Platform=$Platform"
+)
+
+if ($DetoursDir) {
+    $MSBuildArgs += "/p:DetoursDir=$DetoursDir"
+}
+
+& $MSBuild @MSBuildArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."

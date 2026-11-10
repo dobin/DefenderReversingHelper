@@ -285,6 +285,127 @@ PplAllowNonMicrosoftDllsByPid(
 }
 
 //
+// ACG counterpart of PplAllowNonMicrosoftDllsByPid. Only bit 8 is touched;
+// the signature-policy bit and SectionSignatureLevel are left to allow-dlls.
+// If allow-dlls already created a tracking entry, PplTrackMitigationLocked
+// preserves its original values and merges the applied flag set, so one
+// IOCTL_PPL_CLEAR_BY_PID restores both changes.
+//
+NTSTATUS
+PplAllowDynamicCodeByPid(
+    _In_ ULONG ProcessId,
+    _Out_ PPPL_MITIGATION_RESULT Result)
+{
+    PEPROCESS process = NULL;
+    NTSTATUS status;
+    ULONG oldFlags1;
+    ULONG oldFlags2 = 0;
+    ULONG newFlags1;
+    ULONG verifyFlags1;
+    UCHAR oldSignatureLevel;
+    UCHAR oldSectionSignatureLevel;
+    BOOLEAN tracked = FALSE;
+
+    PplpInitializeMitigationResult(
+        Result, STATUS_SUCCESS, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    if (!g_PplOffsetSupported ||
+        g_PplProtectionOffset == 0 ||
+        g_PplOffsets.PsMitigationFlags1Offset == 0) {
+        PplpInitializeMitigationResult(
+            Result, STATUS_NOT_SUPPORTED, 0, 0, 0, 0, 0, 0, 0, 0);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (ProcessId == 0 || ProcessId == 4) {
+        PplpInitializeMitigationResult(
+            Result, STATUS_ACCESS_DENIED, 0, 0, 0, 0, 0, 0, 0, 0);
+        PPL_LOG("refusing PID %lu (system process)", ProcessId);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    status = PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        PplpInitializeMitigationResult(
+            Result, status, 0, 0, 0, 0, 0, 0, 0, 0);
+        PPL_LOG("allow-dynamic-code pid=%lu: process lookup failed 0x%08X",
+                ProcessId, status);
+        return status;
+    }
+
+    if (PplIsBlockedProcess(process, ProcessId, NULL)) {
+        status = STATUS_ACCESS_DENIED;
+        PplpInitializeMitigationResult(
+            Result, status, 0, 0, 0, 0, 0, 0, 0, 0);
+        PPL_LOG("refusing blocklisted process pid=%lu", ProcessId);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    PplTrackLock();
+
+    oldFlags1 = PplReadMitigationFlags(
+        process, g_PplOffsets.PsMitigationFlags1Offset);
+    oldFlags2 = PplReadMitigationFlags(
+        process, g_PplOffsets.PsMitigationFlags2Offset);
+    oldSignatureLevel = PplReadSignatureLevel(process);
+    oldSectionSignatureLevel = PplReadSectionSignatureLevel(process);
+
+    newFlags1 = oldFlags1 & ~PPL_MITIGATION_FLAG_DISABLE_DYNAMIC_CODE;
+
+    if (newFlags1 == oldFlags1) {
+        status = STATUS_SUCCESS;
+        PplpInitializeMitigationResult(
+            Result, status,
+            oldFlags1, oldFlags1, oldFlags2, oldFlags2,
+            oldSignatureLevel, oldSignatureLevel,
+            oldSectionSignatureLevel, oldSectionSignatureLevel);
+        PPL_LOG("allow-dynamic-code pid=%lu: already clear (MitigationFlags1=0x%08lX)",
+                ProcessId, oldFlags1);
+    } else {
+        PplpWriteMitigationFlags(
+            process, g_PplOffsets.PsMitigationFlags1Offset, newFlags1);
+        verifyFlags1 = PplReadMitigationFlags(
+            process, g_PplOffsets.PsMitigationFlags1Offset);
+
+        if (verifyFlags1 != newFlags1) {
+            PplpWriteMitigationFlags(
+                process, g_PplOffsets.PsMitigationFlags1Offset, oldFlags1);
+            status = STATUS_UNSUCCESSFUL;
+            PplpInitializeMitigationResult(
+                Result, status,
+                oldFlags1, verifyFlags1, oldFlags2, oldFlags2,
+                oldSignatureLevel, oldSignatureLevel,
+                oldSectionSignatureLevel, oldSectionSignatureLevel);
+            PPL_LOG("allow-dynamic-code pid=%lu: verify failed (wanted 0x%08lX, got 0x%08lX); restored 0x%08lX",
+                    ProcessId, newFlags1, verifyFlags1, oldFlags1);
+        } else {
+            tracked = PplTrackMitigationLocked(
+                ProcessId, process,
+                PplReadProtection(process),
+                newFlags1, oldFlags1,
+                oldFlags2, oldFlags2,
+                oldSignatureLevel, oldSignatureLevel,
+                oldSectionSignatureLevel, oldSectionSignatureLevel);
+            status = STATUS_SUCCESS;
+            PplpInitializeMitigationResult(
+                Result, status,
+                oldFlags1, newFlags1, oldFlags2, oldFlags2,
+                oldSignatureLevel, oldSignatureLevel,
+                oldSectionSignatureLevel, oldSectionSignatureLevel);
+            PPL_LOG("allow-dynamic-code pid=%lu: MitigationFlags1 0x%08lX -> 0x%08lX (%s)",
+                    ProcessId, oldFlags1, newFlags1,
+                    tracked ? "tracked" : "not tracked");
+        }
+    }
+
+    PplTrackUnlock();
+    ObDereferenceObject(process);
+    return status;
+}
+
+//
 // Best-effort restore of a tracked mitigation change (MitigationFlags1 and
 // SectionSignatureLevel). Returns FALSE if the current value no longer
 // matches what this driver applied, or if the write-back did not verify. The

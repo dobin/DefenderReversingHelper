@@ -109,6 +109,20 @@ error 577. Remove that state only for the test target:
 The change is tracked; `clear --pid` and driver unload restore it. `allow-dlls` returns
 `STATUS_NOT_SUPPORTED` on builds without a MitigationFlags offset.
 
+## Clear ACG for Detours
+
+Detours must make the target's image code pages writable. If ACG
+(`ProcessDynamicCodePolicy`) is enabled, `DetourTransactionCommit` fails with
+`ERROR_DYNAMIC_CODE_BLOCKED` (1655). Clear it only for the test target:
+
+```powershell
+& $PplCtl allow-dynamic-code --pid $targetPid
+& $PplCtl query --pid $targetPid   # MitigationFlags1 bit 8 (0x100) clear
+```
+
+This is tracked and shares the same entry as `allow-dlls`; one `clear --pid` restores
+both. Use `injector.exe ... --allow-dynamic-code` to clear it as part of an injection.
+
 ## Verify every grant
 
 ```powershell
@@ -138,7 +152,8 @@ protected PID, including filter/broker clients:
 Stop the test broker/clients (Ctrl+C, or a specific recorded PID). Leave the driver loaded.
 Clear protection before attempting to terminate a protected target. `STATUS_NOT_FOUND`
 is harmless if it exited; `STATUS_ACCESS_DENIED` on clear means untracked protection—do
-not force removal. `clear --pid` also restores an `allow-dlls` change. Report failures or
+not force removal. `clear --pid` also restores an `allow-dlls` or
+`allow-dynamic-code` change. Report failures or
 remaining PPL to the user; never reboot to fix them.
 For `STATUS_NOT_SUPPORTED`, stop and report an unsupported build or missing callback.
 

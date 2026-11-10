@@ -13,7 +13,7 @@ typedef LONG NTSTATUS;
 #define PPL_USER_NTSTATUS_DEFINED
 #endif
 
-#define PPL_DRIVER_VERSION          L"1.3.0"
+#define PPL_DRIVER_VERSION          L"1.4.0"
 #define PPL_DEVICE_NAME             L"\\Device\\MakeMePPL"
 #define PPL_SYMLINK_NAME            L"\\??\\MakeMePPL"
 #define PPL_WIN32_DEVICE            L"\\\\.\\MakeMePPL"
@@ -68,6 +68,13 @@ typedef LONG NTSTATUS;
 // mitigations and is not modified.
 //
 #define PPL_MITIGATION_FLAG_SIGNATURE_OPT_IN 0x00800000
+
+//
+// EPROCESS!MitigationFlags1 bit 8: DisableDynamicCode / Arbitrary Code Guard
+// (ACG, SetProcessMitigationPolicy(ProcessDynamicCodePolicy)). ACG has to be
+// clear before Detours can change an image code page to writable.
+//
+#define PPL_MITIGATION_FLAG_DISABLE_DYNAMIC_CODE 0x00000100
 
 //
 // PPL_QUERY_RESULT.Flags bits.
@@ -126,6 +133,14 @@ typedef LONG NTSTATUS;
 //
 #define IOCTL_PPL_CREATE_REMOTE_THREAD \
     CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// Clears EPROCESS!MitigationFlags1 bit 8 (DisableDynamicCode / ACG) so
+// in-process inline hooks can make image code pages writable. Uses
+// PPL_MITIGATION_REQUEST / PPL_MITIGATION_RESULT and is tracked for restore.
+//
+#define IOCTL_PPL_ALLOW_DYNAMIC_CODE \
+    CTL_CODE(PPL_DEVICE_TYPE, PPL_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 typedef struct _PPL_REMOTE_THREAD_REQUEST {
     ULONG   ProcessId;        // target process, for validation

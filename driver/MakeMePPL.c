@@ -349,6 +349,34 @@ PplpDeviceControl(
         break;
     }
 
+    case IOCTL_PPL_ALLOW_DYNAMIC_CODE:
+    {
+        PPL_MITIGATION_REQUEST request;
+        PPL_MITIGATION_RESULT* result = (PPL_MITIGATION_RESULT*)systemBuffer;
+
+        if (inputLength < sizeof(request) || systemBuffer == NULL) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(*result)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlCopyMemory(&request, systemBuffer, sizeof(request));
+        RtlZeroMemory(systemBuffer, outputLength);
+
+        if (request.ProcessId == 0 || request.Reserved != 0) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        (VOID)PplAllowDynamicCodeByPid(request.ProcessId, result);
+        status = STATUS_SUCCESS;
+        information = sizeof(*result);
+        break;
+    }
+
     case IOCTL_PPL_FORCE_CLEAR_BY_PID:
     {
         ULONG processId;
