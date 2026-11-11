@@ -388,17 +388,14 @@ HandleReturnEvent(
 {
     uint32_t sequence = 0;
     uint32_t status = 0;
-    uint64_t elapsedUs = 0;
 
     Parser.try_parse(L"SeqNum", sequence);
     Parser.try_parse(L"Status", status);
-    Parser.try_parse(L"ElapsedUs", elapsedUs);
 
-    Print(Format("%s seq=%lu RETURN status=0x%08lX elapsed=%.3f ms\n",
+    Print(Format("%s seq=%lu RETURN status=0x%08lX\n",
                  Prefix.c_str(),
                  (unsigned long)sequence,
-                 (unsigned long)status,
-                 (double)elapsedUs / 1000.0));
+                 (unsigned long)status));
 }
 
 void

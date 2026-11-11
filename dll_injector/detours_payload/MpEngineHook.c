@@ -19,7 +19,7 @@
  *                    (RSI_CONTEXT_DUMP_BYTES) and of the Data buffer
  *                    (RSI_DATA_DUMP_BYTES), captured before the real function
  *                    runs so the payload is exactly what mpengine received
- *     RSignalReturn  the return value and elapsed time in microseconds
+ *     RSignalReturn  the return value
  *     Status         install/diagnostic messages ("payload attached", errors)
  *
  * When no ETW session has the provider enabled, TraceLoggingWrite is a cheap
@@ -122,7 +122,6 @@ TRACELOGGING_DEFINE_PROVIDER(
 static PFN___rsignal g_Real__rsignal = NULL;
 static volatile LONG g_HookCalls = 0;
 static volatile LONG g_ProviderRegistered = 0;
-static ULONGLONG g_QpcFrequency = 0;
 static __declspec(thread) LONG g_InHook = 0;
 
 /* ------------------------------------------------------------------------- */
@@ -313,8 +312,7 @@ EmitCall(
 static void
 EmitReturn(
     _In_ LONG Sequence,
-    _In_ ULONG Status,
-    _In_ ULONGLONG ElapsedUs)
+    _In_ ULONG Status)
 {
     TraceLoggingWrite(
         g_hRSignalProvider,
@@ -322,8 +320,7 @@ EmitReturn(
         TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
         TraceLoggingUInt32(MPENGINE_ETW_TYPE_RETURN, "Type"),
         TraceLoggingUInt32((UINT32)Sequence, "SeqNum"),
-        TraceLoggingUInt32(Status, "Status"),
-        TraceLoggingUInt64(ElapsedUs, "ElapsedUs"));
+        TraceLoggingUInt32(Status, "Status"));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -340,9 +337,6 @@ Hook___rsignal(
     PFN___rsignal real = g_Real__rsignal;
     ULONG status;
     LONG  call;
-    LARGE_INTEGER start = { 0 };
-    LARGE_INTEGER end = { 0 };
-    ULONGLONG elapsedUs = 0;
 
     if (real == NULL) {
         return 0;
@@ -363,23 +357,10 @@ Hook___rsignal(
         EmitCall(Context, Signal, Data, Flags, call);
     }
 
-    if (g_QpcFrequency != 0) {
-        QueryPerformanceCounter(&start);
-    }
-
     status = real(Context, Signal, Data, Flags);
 
-    if (g_QpcFrequency != 0) {
-        QueryPerformanceCounter(&end);
-        if (end.QuadPart >= start.QuadPart) {
-            elapsedUs = (ULONGLONG)
-                (((end.QuadPart - start.QuadPart) * 1000000ull) /
-                 g_QpcFrequency);
-        }
-    }
-
     if (TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
-        EmitReturn(call, status, elapsedUs);
+        EmitReturn(call, status);
     }
 
     InterlockedDecrement(&g_InHook);
@@ -501,7 +482,6 @@ InstallHooksThread(
     char    host[MAX_PATH] = { 0 };
     HANDLE  threadHandles[MAX_ENLISTED_THREADS];
     DWORD   threadCount = 0;
-    LARGE_INTEGER frequency = { 0 };
 
     (void)Parameter;
 
@@ -513,9 +493,6 @@ InstallHooksThread(
     if (SUCCEEDED(TraceLoggingRegister(g_hRSignalProvider))) {
         InterlockedExchange(&g_ProviderRegistered, 1);
     }
-
-    QueryPerformanceFrequency(&frequency);
-    g_QpcFrequency = (ULONGLONG)frequency.QuadPart;
 
     /*
      * No-op unless the process was started through DetourCreateProcessWithDll*.

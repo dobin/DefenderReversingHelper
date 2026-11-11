@@ -42,7 +42,7 @@ block or modify anything. For each call it emits:
    taken **before** the real function runs, so it is exactly what mpengine
    received. Hex text is used instead of a binary field so every consumer
    decodes the same bytes without TraceLogging binary length-prefix ambiguity.
-2. `RSignalReturn` — the return value and elapsed microseconds.
+2. `RSignalReturn` — the return value.
 3. `Status` — install/diagnostic messages (`payload attached`,
    `Detours hook installed`, failures) with a Win32 error code where relevant.
 
@@ -110,7 +110,7 @@ By default each call is a single line with the arguments and data size:
 
 ```text
 [2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 CALL signal=0x4019 flags=0x10 data=0x0000004A2B3C0000 (976 bytes)
-[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 RETURN status=0x0000800E elapsed=0.123 ms
+[2026-11-10 12:34:56.789] pid=4321 tid=8765 seq=1 RETURN status=0x0000800E
 ```
 
 Add `--dump` for the hex+ASCII payload:

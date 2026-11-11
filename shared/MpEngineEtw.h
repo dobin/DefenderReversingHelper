@@ -41,7 +41,6 @@
  *                 ContextHex(String) DataHex(String)
  *
  *   RSignalReturn Type(UInt32) SeqNum(UInt32) Status(UInt32)
- *                 ElapsedUs(UInt64)
  *
  *   Status        Type(UInt32) SeqNum(UInt32) Code(UInt32) Message(String)
  *
