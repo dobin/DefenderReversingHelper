@@ -46,6 +46,7 @@ struct Options {
     std::wstring   session = MPENGINE_ETW_SESSION_NAME;
     std::wstring   outPath;
     bool           dump = false;         /* default: sizes only */
+    bool           binaryFormat = false; /* --out stores framed binary CALL payloads */
     size_t         dumpBytes = 512;      /* 0 = print everything */
     uint64_t       maxEvents = 0;        /* 0 = unlimited */
     bool           showStatus = true;
@@ -96,10 +97,38 @@ Print(
     fputs(Text.c_str(), stdout);
     fflush(stdout);
 
-    if (g_out != nullptr) {
+    if (g_out != nullptr && !g_options.binaryFormat) {
         fputs(Text.c_str(), g_out);
         fflush(g_out);
     }
+}
+
+bool
+WriteBinaryEvent(
+    _In_ uint32_t SignalId,
+    _In_reads_bytes_(PayloadSize) const BYTE* Payload,
+    _In_ uint32_t PayloadSize)
+{
+    if (g_out == nullptr) {
+        return false;
+    }
+
+    /* Encode fields explicitly so the on-disk header is always little-endian. */
+    BYTE header[10] = {
+        0x45, 0x56,
+        (BYTE)SignalId, (BYTE)(SignalId >> 8),
+        (BYTE)(SignalId >> 16), (BYTE)(SignalId >> 24),
+        (BYTE)PayloadSize, (BYTE)(PayloadSize >> 8),
+        (BYTE)(PayloadSize >> 16), (BYTE)(PayloadSize >> 24)
+    };
+
+    std::lock_guard<std::mutex> lock(g_outputLock);
+    if (fwrite(header, sizeof(header), 1, g_out) != 1 ||
+        (PayloadSize != 0 && fwrite(Payload, PayloadSize, 1, g_out) != 1)) {
+        return false;
+    }
+
+    return fflush(g_out) == 0;
 }
 
 std::string
@@ -346,14 +375,33 @@ HandleCallEvent(
 
     bool hexOk = true;
 
-    if (g_options.dump) {
-        Parser.try_parse(L"DataHex", dataHex);
-        hexOk = HexDecode(dataHex, dataBytes);
+    if (g_options.dump || g_options.binaryFormat) {
+        hexOk = Parser.try_parse(L"DataHex", dataHex) &&
+                HexDecode(dataHex, dataBytes);
+    }
+
+    if (g_options.binaryFormat && hexOk) {
+        if (!WriteBinaryEvent((uint32_t)signal, dataBytes.data(),
+                              (uint32_t)dataBytes.size())) {
+            fprintf(stderr, "failed to write binary event\n");
+        }
     }
 
     std::string text;
 
-    if (g_options.dump) {
+    if (g_options.binaryFormat) {
+        text = Format(
+            "%s seq=%lu CALL signal=0x%X flags=0x%X data=0x%016llX (%lu bytes)\n",
+            Prefix.c_str(),
+            (unsigned long)sequence,
+            (unsigned int)signal,
+            (unsigned int)flags,
+            (unsigned long long)dataAddress,
+            (unsigned long)dataLength);
+        if (!hexOk) {
+            text += "    (could not decode hex buffer field; event not written)\n";
+        }
+    } else if (g_options.dump) {
         text = Format(
             "%s seq=%lu CALL signal=0x%X flags=0x%X data=0x%016llX\n",
             Prefix.c_str(),
@@ -462,7 +510,9 @@ Usage(void)
         "Usage: rsignal_etw_listener [options]\n"
         "\n"
         "  --session <name>   real-time ETW session name\n"
-        "  --out <file>       also write the rendered text to <file>\n"
+        "  --out <file>       write rendered text (or binary records) to <file>\n"
+        "  --format <format>  output format: text (default) or binary\n"
+        "                     binary writes CALL payloads as EV + signal ID + size + data\n"
         "  --dump             print a hex+ASCII dump of the data buffer\n"
         "  --dump-bytes <n>   bytes of the buffer to dump (implies --dump;\n"
         "                     0 = all, default 512)\n"
@@ -525,6 +575,20 @@ ParseOptions(
                 return false;
             }
             g_options.outPath = value;
+        } else if (argument == L"--format") {
+            const wchar_t* value = next(L"--format");
+
+            if (value == nullptr) {
+                return false;
+            }
+            if (_wcsicmp(value, L"text") == 0) {
+                g_options.binaryFormat = false;
+            } else if (_wcsicmp(value, L"binary") == 0) {
+                g_options.binaryFormat = true;
+            } else {
+                fprintf(stderr, "invalid --format (expected text or binary)\n");
+                return false;
+            }
         } else if (argument == L"--dump") {
             g_options.dump = true;
         } else if (argument == L"--no-dump") {
@@ -555,6 +619,11 @@ ParseOptions(
         }
     }
 
+    if (g_options.binaryFormat && g_options.outPath.empty()) {
+        fprintf(stderr, "--format binary requires --out <file>\n");
+        return false;
+    }
+
     return true;
 }
 
@@ -570,7 +639,8 @@ wmain(
     }
 
     if (!g_options.outPath.empty()) {
-        if (_wfopen_s(&g_out, g_options.outPath.c_str(), L"w") != 0 ||
+        const wchar_t* mode = g_options.binaryFormat ? L"wb" : L"w";
+        if (_wfopen_s(&g_out, g_options.outPath.c_str(), mode) != 0 ||
             g_out == nullptr) {
             fprintf(stderr, "cannot open output file\n");
             return 1;

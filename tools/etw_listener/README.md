@@ -18,7 +18,8 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--session <name>` | Override the real-time session name |
-| `--out <file>` | Also write the rendered text to a file |
+| `--out <file>` | Write rendered text or binary records to a file |
+| `--format <text\|binary>` | Output format (`text` is the default; `binary` requires `--out`) |
 | `--dump` | Print a hex+ASCII dump of the data buffer |
 | `--dump-bytes <n>` | Bytes of the buffer to dump (implies `--dump`; `0` = all, default 512) |
 | `--no-dump` | Compact output (default): signal, flags, data address and size |
@@ -33,6 +34,11 @@ By default each call is one line:
 ```
 
 Add `--dump` (optionally with `--dump-bytes`) for the hex+ASCII data buffer.
+For framed binary payload records, use `--out rsignal.bin --format binary`.
+Each CALL is written as a 10-byte little-endian header followed by the raw
+payload: magic `0x5645` (`EV`), 32-bit signal ID, 32-bit payload size, payload.
+Only CALL events are written to the binary file; status and return events are
+still shown in the console output.
 
 The consumer needs to create an ETW session, so run it elevated or as a member
 of **Performance Log Users**. It can start before or after the payload
