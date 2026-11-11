@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     details_parser = commands.add_parser("details", help="Get one event and its payload")
     details_parser.add_argument("event_id", type=int, help="1-based ID shown by list")
     details_parser.add_argument("--output", help="Save raw payload bytes to this file")
+    details_parser.add_argument(
+        "--encoding",
+        choices=("base64", "hex"),
+        default="base64",
+        help="Payload encoding in JSON output (default: base64)",
+    )
     return parser
 
 
@@ -125,7 +131,10 @@ def main() -> None:
                     output.write(payload)
                 result["payload_file"] = args.output
             else:
-                result["payload_base64"] = base64.b64encode(payload).decode("ascii")
+                if args.encoding == "hex":
+                    result["payload_hex"] = payload.hex()
+                else:
+                    result["payload_base64"] = base64.b64encode(payload).decode("ascii")
         print(json.dumps(result))
     except (OSError, ValueError) as error:
         parser.error(str(error))
