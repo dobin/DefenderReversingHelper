@@ -1,3 +1,4 @@
+import argparse
 import mmap
 import struct
 from typing import Generator, Tuple
@@ -43,7 +44,10 @@ def stream_events(filepath: str) -> Generator[Tuple[int, bytes], None, None]:
                 offset = payload_end
 
 
-# Usage Example
 if __name__ == "__main__":
-    for signal_id, payload in stream_events("events.bin"):
+    parser = argparse.ArgumentParser(description="Parse events from a binary log.")
+    parser.add_argument("--file", required=True, help="Path to the binary log file")
+    args = parser.parse_args()
+
+    for signal_id, payload in stream_events(args.file):
         print(f"Signal ID: {signal_id} | Payload size: {len(payload)} bytes")
