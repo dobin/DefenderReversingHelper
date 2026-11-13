@@ -236,6 +236,45 @@ MpTelemetryRequestorPid(
     return pid;
 }
 
+/*
+ * Process creation time of the acting process.
+ *
+ * The engine resolves a note's process with an exact {creation time, pid}
+ * lookup in its ProcessInfoMap, and
+ * Defender's MpRtp stamps the FILETIME on every note it builds with
+ * GetProcessTimes.  A zero here does not match anything, so the file event
+ * would be dropped or evaluated against an unknown process.
+ *
+ * The requestor is normally the current process, which needs no lookup.  A
+ * foreign requestor only occurs for I/O issued by a worker thread on behalf of
+ * another process; PsLookupProcessByProcessId is used then, but only at
+ * PASSIVE_LEVEL (it may block) -- above that the event keeps 0.
+ */
+UINT64
+MpTelemetryProcessCreateTime(
+    _In_ ULONG ProcessId)
+{
+    PEPROCESS process = NULL;
+    UINT64 createTime;
+
+    if (ProcessId == 0) {
+        return 0;
+    }
+    if (ProcessId == (ULONG)(ULONG_PTR)PsGetCurrentProcessId()) {
+        return (UINT64)PsGetProcessCreateTimeQuadPart(PsGetCurrentProcess());
+    }
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        return 0;
+    }
+    if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)ProcessId,
+                                               &process))) {
+        return 0;
+    }
+    createTime = (UINT64)PsGetProcessCreateTimeQuadPart(process);
+    ObDereferenceObject(process);
+    return createTime;
+}
+
 VOID
 MpTelemetryEmitCurrentFileEx(
     _In_ PFLT_CALLBACK_DATA Data,
@@ -272,7 +311,9 @@ MpTelemetryEmitCurrentFileEx(
     }
 
     (void)MpTelemetrySendEvent(pid, EventId, Flags, 0, CreateOptions,
-                               FileAttributes, Extra, 0, info->Name.Buffer,
+                               FileAttributes, Extra,
+                               MpTelemetryProcessCreateTime(pid),
+                               info->Name.Buffer,
                                info->Name.Length / sizeof(WCHAR), NULL, 0);
     FltReleaseFileNameInformation(info);
 }

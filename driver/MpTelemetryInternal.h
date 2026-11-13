@@ -76,6 +76,12 @@ MpTelemetrySendEvent(
 /* Requestor filtering and the single-name file event helper. */
 ULONG MpTelemetryRequestorPid(_In_ PFLT_CALLBACK_DATA Data);
 
+/* Process creation time (100ns FILETIME) for the acting process, or 0 when it
+ * cannot be resolved.  The engine keys its ProcessInfoMap by
+ * {creation time, pid}; a file event without it is not attributed to any
+ * process.  Must be called at IRQL <= APC_LEVEL. */
+UINT64 MpTelemetryProcessCreateTime(_In_ ULONG ProcessId);
+
 VOID
 MpTelemetryEmitCurrentFileEx(
     _In_ PFLT_CALLBACK_DATA Data,

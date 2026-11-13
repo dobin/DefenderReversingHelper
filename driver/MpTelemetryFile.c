@@ -386,9 +386,12 @@ MpTelemetryPreSetInformation(
         }
 
         if (oldInfo != NULL && newInfo != NULL) {
+            ULONG renamePid = MpTelemetryRequestorPid(Data);
+
             (void)MpTelemetrySendEvent(
-                MpTelemetryRequestorPid(Data),
-                MP_TELEMETRY_EVENT_FILE_RENAME, 0, 0, 0, 0, 0, 0,
+                renamePid,
+                MP_TELEMETRY_EVENT_FILE_RENAME, 0, 0, 0, 0, 0,
+                MpTelemetryProcessCreateTime(renamePid),
                 oldInfo->Name.Buffer,
                 oldInfo->Name.Length / sizeof(WCHAR),
                 newInfo->Name.Buffer,

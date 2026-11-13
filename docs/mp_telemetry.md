@@ -58,13 +58,19 @@ typedef struct _MP_TELEMETRY_EVENT {
 |---|---|---|
 | `PROCESS_CREATE` | `0x0001` | process note event 1, image + create time |
 | `PROCESS_EXIT` | `0x0002` | counted only |
-| `FILE_CREATE` | `0x0010` | `MP_RTP_FILE_CREATE` |
+| `FILE_CREATE` | `0x0010` | `MP_RTP_FILE_CREATE` (requestor create time) |
 | `FILE_WRITE` | `0x0011` | `MP_RTP_FILE_WRITE` when enabled |
-| `FILE_CLOSE` | `0x0012` | `MP_RTP_FILE_CLOSE` if dirty |
-| `FILE_RENAME` | `0x0013` | rename note (both paths) |
+| `FILE_CLOSE` | `0x0012` | `mp_rtp_note_file_close` (0xf0 close record) if dirty |
+| `FILE_RENAME` | `0x0013` | rename note (both paths, requestor create time) |
 | `FILE_DELETE` | `0x0014` | `MP_RTP_FILE_DELETE` |
 | `FILE_SET_INFO` | `0x0015` | `MP_RTP_FILE_CHANGE` |
 | `FILE_SET_SECURITY` | `0x0016` | `MP_RTP_FILE_SET_SECURITY` |
+
+`CreateTime` is the requestor process creation FILETIME for every event that
+carries a process id: `PsGetProcessCreateTimeQuadPart` of the current process,
+or a `PsLookupProcessByProcessId` at PASSIVE_LEVEL for a foreign requestor.
+The engine keys its ProcessInfoMap by `{create time, pid}` and compares both
+halves, so a zero value leaves the note unattributable.
 
 `FILE_CREATE` carries the `NtCreateFile` disposition in the high byte of
 `CreateOptions`.  `Flags` bit `0x8` (`WRITE_ACCESS`) is set when the requested
@@ -108,6 +114,12 @@ minifilter operation table and the file callbacks.
   - `IRP_MJ_SET_SECURITY` pre-op: `FILE_SET_SECURITY`.
 - `FltGetRequestorProcessId` filters pid 0/4 and the connected consumer's pid,
   so the agent's own scans cannot feed back into the note stream.
+- `MpTelemetryProcessCreateTime` resolves the acting process's FILETIME for
+  every event that names a process.  The engine's BM ProcessInfoMap is keyed by
+  `{create time, pid}` and compares both halves, so a file event without the
+  real time is dropped or evaluated against an unknown process.  The current
+  process needs no lookup; a foreign requestor is resolved with
+  `PsLookupProcessByProcessId` at PASSIVE_LEVEL only.
 - A shared `ERESOURCE` serialises sends against disconnect/shutdown. There is
   no reply buffer, so `FltSendMessage` is fire-and-forget, but it is never
   called without a timeout: telemetry runs inside file/process callbacks, so an
@@ -206,8 +218,14 @@ usable instance and `PplCtl info` shows `telemetry : unavailable`.
    scans.
 4. File/process messages become `mp_rtp_note_*` notes and are sent through
    `0x4039`; `note.process_id` is the kernel-reported requestor pid and
-   `note.create_time` is 0 for file notes (match by pid).
-5. On stop, the stopper sets the stop flag and cancels the blocking
+   `note.create_time` is the requestor's creation time from the wire event.
+   Close notes use `mp_rtp_note_file_close` (the engine's close factory reads a
+   240-byte record, not the generic file payload).
+5. With `MP_DRV_FLAG_ENUMERATE_PROCESSES` the consumer registers the processes
+   that already exist at start-up, because the kernel process callback only
+   reports new ones.  Each entry is a process-create note carrying
+   `GetProcessTimes` and `QueryFullProcessImageNameW` data.
+6. On stop, the stopper sets the stop flag and cancels the blocking
    `FilterGetMessage` (`CancelSynchronousIo` / `CancelIoEx`, retried until the
    receive thread exits), then joins the dispatch thread. The receive thread
    owns closing the port. The driver consumer is stopped before

@@ -13,7 +13,7 @@ typedef LONG NTSTATUS;
 #define PPL_USER_NTSTATUS_DEFINED
 #endif
 
-#define PPL_DRIVER_VERSION          L"1.4.0"
+#define PPL_DRIVER_VERSION          L"1.4.1"
 #define PPL_DEVICE_NAME             L"\\Device\\MakeMePPL"
 #define PPL_SYMLINK_NAME            L"\\??\\MakeMePPL"
 #define PPL_WIN32_DEVICE            L"\\\\.\\MakeMePPL"
