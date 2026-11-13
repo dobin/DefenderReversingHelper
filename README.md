@@ -160,10 +160,11 @@ cd C:\Data\defender-2026-autumn\mpclient
 .\mpengine_test.exe diag drv --seconds 3 --no-elevate
 ```
 
-`Install-Driver.ps1` writes the minifilter `Instances\MakeMePPL Instance`
-altitude/instance registry values between `sc create` and `sc start`.
-`MpTelemetryInitialize` is best effort: if `FltRegisterFilter` or
-`FltStartFiltering` fails, PPL/injection keep working and `PplCtl info`
+`Install-Driver.ps1` installs `driver/MakeMePPL.inf`, which creates the
+file-system service and the minifilter `Instances\MakeMePPL Instance` altitude
+entry that `FltRegisterFilter` requires. `Sign-Driver.ps1` also builds and signs
+`MakeMePPL.cat`. `MpTelemetryInitialize` is best effort: if `FltRegisterFilter`
+or `FltStartFiltering` fails, PPL/injection keep working and `PplCtl info`
 reports `telemetry : unavailable`. The port DACL allows any local user,
 consistent with the rest of this test driver; restrict it before using this
 outside an isolated VM.

@@ -54,6 +54,19 @@ if (Test-Path $serviceKey) {
         -ErrorAction SilentlyContinue
 }
 
+#
+# The INF copies the driver into the drivers directory; sc delete leaves that
+# file behind.  Remove it only after the service has stopped, otherwise the
+# loaded image is still mapped.
+#
+$installedDriver = Join-Path $env:SystemRoot 'System32\drivers\MakeMePPL.sys'
+if (Test-Path $installedDriver) {
+    Remove-Item -Path $installedDriver -Force -ErrorAction SilentlyContinue
+    if (Test-Path $installedDriver) {
+        Write-Warning "Could not delete '$installedDriver'. It may still be loaded or pending unload."
+    }
+}
+
 Write-Host ''
 & sc.exe query $ServiceName | Out-Host
 Write-Host ''

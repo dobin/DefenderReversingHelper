@@ -1,0 +1,89 @@
+;
+; MakeMePPL.inf
+;
+; Installation for MakeMePPL.sys, a legacy (non-PnP) file-system minifilter.
+;
+; This INF replaces the manual registry writes that scripts\Install-Driver.ps1
+; used to perform after "sc create": the [MakeMePPL.AddRegistry] section creates
+; the Instances\DefaultInstance, Altitude and Flags values that FltRegisterFilter
+; needs, and SupportedFeatures tells FltMgr which features the filter supports.
+;
+; Install (elevated):
+;   InfDefaultInstall.exe driver\MakeMePPL.inf
+; or:
+;   rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall 132 <path>\MakeMePPL.inf
+;
+; Uninstall (elevated):
+;   rundll32.exe setupapi.dll,InstallHinfSection DefaultUninstall 132 <path>\MakeMePPL.inf
+;
+; The service is stopped and deleted by scripts\Uninstall-Driver.ps1, which
+; does not depend on the INF being present.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = FSFilter
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderName%
+DriverVer   = 01/01/2026,1.0.0.0
+CatalogFile = MakeMePPL.cat
+
+[DestinationDirs]
+DefaultDestDir        = 12
+MakeMePPL.DriverFiles = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+MakeMePPL.sys = 1,,
+
+;
+; Legacy (non-PnP) install.  SetupAPI copies MakeMePPL.sys to
+; %SystemRoot%\System32\drivers and adds the service below.
+;
+[DefaultInstall]
+OptionDesc = %ServiceDescription%
+CopyFiles  = MakeMePPL.DriverFiles
+
+[DefaultInstall.Services]
+AddService = %ServiceName%,,MakeMePPL.Service
+
+[DefaultUninstall]
+DelFiles = MakeMePPL.DriverFiles
+
+[DefaultUninstall.Services]
+DelService = %ServiceName%,0x200   ; SPSVCINST_STOPSERVICE
+
+[MakeMePPL.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\%DriverFileName%.sys
+Dependencies   = FltMgr
+ServiceType    = 2                 ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3                 ; SERVICE_DEMAND_START
+ErrorControl   = 1                 ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "FSFilter Anti-Virus"
+AddReg         = MakeMePPL.AddRegistry
+
+;
+; HKR is the service key.  These are the same values the old install script
+; wrote by hand; FltRegisterFilter reports "no usable instance" without them.
+;
+[MakeMePPL.AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x0000000F
+HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
+HKR,"Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Instances\%InstanceName%","Flags",0x00010001,0x00000000
+
+[MakeMePPL.DriverFiles]
+%DriverFileName%.sys
+
+[Strings]
+ProviderName       = "DefenderReversingHelper"
+DiskName           = "MakeMePPL Installation Disk"
+ServiceName        = "MakeMePPL"
+ServiceDescription = "MakeMePPL PPL and WdFilter-style telemetry driver"
+DriverFileName     = "MakeMePPL"
+InstanceName       = "MakeMePPL Instance"
+InstanceAltitude   = "328500"

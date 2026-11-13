@@ -146,27 +146,37 @@ minifilter operation table and the file callbacks.
 - Close `PplCtl` and the broker before `sc stop`: an open handle to the control
   device keeps the driver image referenced even after the filter unregisters.
 
-### Minifilter registration without an INF
+### Minifilter registration (`driver/MakeMePPL.inf`)
 
 FltMgr needs a default instance and an altitude entry, which a minifilter INF
-would normally create. `scripts/Install-Driver.ps1` creates the service as a
-file-system driver (`sc create type= filesys`) and writes the registry values
-between `sc create` and `sc start`:
+creates. `driver/MakeMePPL.inf` is an `FSFilter`-class legacy (non-PnP) INF;
+`scripts/Build.ps1` stages it next to `MakeMePPL.sys` in `bin\<Configuration>`.
 
-```powershell
-$serviceKey   = "HKLM:\SYSTEM\CurrentControlSet\Services\MakeMePPL"
-$instancesKey = Join-Path $serviceKey 'Instances'
-$instanceKey  = Join-Path $instancesKey "MakeMePPL Instance"
-New-Item -Path $instanceKey -Force
-New-ItemProperty -Path $instancesKey -Name DefaultInstance `
-    -Value 'MakeMePPL Instance' -PropertyType String
-New-ItemProperty -Path $instanceKey -Name Altitude -Value '328500' `
-    -PropertyType String
-New-ItemProperty -Path $instanceKey -Name Flags -Value 0 `
-    -PropertyType DWord
-New-ItemProperty -Path $serviceKey -Name SupportedFeatures -Value 15 `
-    -PropertyType DWord
+The service section installs `MakeMePPL.sys` into
+`%SystemRoot%\System32\drivers` as `SERVICE_FILE_SYSTEM_DRIVER`
+(`ServiceType = 2`, `StartType = 3`) with `Dependencies = FltMgr` and
+`LoadOrderGroup = "FSFilter Anti-Virus"`. The instance data lives in the same
+INF:
+
+```ini
+[MakeMePPL.AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x0000000F
+HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
+HKR,"Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Instances\%InstanceName%","Flags",0x00010001,0x00000000
 ```
+
+with `InstanceName = "MakeMePPL Instance"` and `InstanceAltitude = "328500"`.
+These are exactly the values the old hand-written workaround created.
+
+`scripts/Install-Driver.ps1` stops/deletes any previous service, installs the
+package with `InfDefaultInstall.exe` (falling back to
+`rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall 132 <inf>`),
+verifies that `Instances\DefaultInstance` and its `Altitude` exist, then starts
+the service. `scripts/Sign-Driver.ps1` also runs `inf2cat` and signs
+`MakeMePPL.cat`; the embedded `.sys` signature is still what the loader checks.
+`scripts/Uninstall-Driver.ps1` stops/deletes the service and removes the copy
+under `System32\drivers`.
 
 `DefaultInstance` is required; without it `FltStartFiltering` reports no
 usable instance and `PplCtl info` shows `telemetry : unavailable`.

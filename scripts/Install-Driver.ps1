@@ -5,6 +5,8 @@ param(
 
     [string]$DriverPath,
 
+    [string]$InfPath,
+
     [string]$ServiceName = 'MakeMePPL'
 )
 
@@ -13,6 +15,9 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 if (-not $DriverPath) {
     $DriverPath = Join-Path $Root "bin\$Configuration\MakeMePPL.sys"
+}
+if (-not $InfPath) {
+    $InfPath = Join-Path $Root "bin\$Configuration\MakeMePPL.inf"
 }
 
 function Assert-Administrator {
@@ -28,7 +33,12 @@ Assert-Administrator
 if (-not (Test-Path $DriverPath)) {
     throw "Driver not found at '$DriverPath'. Run scripts\Build.ps1 and scripts\Sign-Driver.ps1 first."
 }
+if (-not (Test-Path $InfPath)) {
+    throw "INF not found at '$InfPath'. Run scripts\Build.ps1 first (it stages the INF next to the driver)."
+}
+
 $DriverPath = (Resolve-Path $DriverPath).Path
+$InfPath = (Resolve-Path $InfPath).Path
 
 $testSigning = (& bcdedit.exe /enum '{current}' 2>$null) -join "`n"
 if ($testSigning -notmatch 'testsigning\s+Yes') {
@@ -47,31 +57,48 @@ for ($i = 0; $i -lt 100; $i++) {
 & sc.exe delete $ServiceName | Out-Host
 Start-Sleep -Milliseconds 500
 
-Write-Host "Creating '$ServiceName' -> $DriverPath"
-& sc.exe create $ServiceName type= filesys start= demand error= normal group= "FSFilter Anti-Virus" depend= FltMgr binPath= "`"$DriverPath`""
+#
+# Install the driver package through MakeMePPL.inf.  The INF's
+# [DefaultInstall.Services] section creates the file-system service and its
+# [MakeMePPL.AddRegistry] section writes the Instances\DefaultInstance,
+# Altitude and Flags values that FltRegisterFilter requires.  This is the same
+# data the old script created by hand, but in the normal minifilter package.
+#
+Write-Host "Installing driver package from $InfPath..."
+$InfDefaultInstall = Join-Path $env:SystemRoot 'System32\InfDefaultInstall.exe'
+if (Test-Path $InfDefaultInstall) {
+    & $InfDefaultInstall $InfPath | Out-Host
+} else {
+    # Quote the comma: unquoted, PowerShell would split the library and the
+    # entry point into two arguments.
+    & rundll32.exe 'setupapi.dll,InstallHinfSection' DefaultInstall 132 $InfPath
+}
 if ($LASTEXITCODE -ne 0) {
-    throw "sc.exe create failed with exit code $LASTEXITCODE."
+    Write-Warning "INF installation returned exit code $LASTEXITCODE; verifying the registry below."
 }
 
 #
-# Register a default minifilter instance.  MakeMePPL now also hosts the
-# WdFilter-style telemetry source (MpTelemetry.c); FltRegisterFilter needs a
-# DefaultInstance plus an altitude entry under the service key.  These are
-# normally written by a minifilter INF.  Every other minifilter on the system
-# (WdFilter, FileInfo, FileCrypt, bindflt) has the same shape.
+# InfDefaultInstall does not always return a useful exit code, so verify the
+# service and minifilter instance that the INF is responsible for.
 #
 $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 $instancesKey = Join-Path $serviceKey 'Instances'
-$instanceKey = Join-Path $instancesKey "$ServiceName Instance"
-New-Item -Path $instanceKey -Force | Out-Null
-New-ItemProperty -Path $instancesKey -Name 'DefaultInstance' `
-    -Value "$ServiceName Instance" -PropertyType String -Force | Out-Null
-New-ItemProperty -Path $instanceKey -Name 'Altitude' -Value '328500' `
-    -PropertyType String -Force | Out-Null
-New-ItemProperty -Path $instanceKey -Name 'Flags' -Value 0 `
-    -PropertyType DWord -Force | Out-Null
-New-ItemProperty -Path $serviceKey -Name 'SupportedFeatures' -Value 15 `
-    -PropertyType DWord -Force | Out-Null
+if (-not (Test-Path $serviceKey)) {
+    throw "The INF did not create the '$ServiceName' service key. Check the setupapi.dev.log for details."
+}
+
+$defaultInstance = (Get-ItemProperty -Path $instancesKey -Name 'DefaultInstance' -ErrorAction SilentlyContinue).DefaultInstance
+if (-not $defaultInstance) {
+    throw "The INF did not create '$instancesKey\DefaultInstance'. FltStartFiltering would report no usable instance."
+}
+
+$instanceKey = Join-Path $instancesKey $defaultInstance
+$altitude = (Get-ItemProperty -Path $instanceKey -Name 'Altitude' -ErrorAction SilentlyContinue).Altitude
+if (-not $altitude) {
+    throw "The INF did not create '$instanceKey\Altitude'."
+}
+
+Write-Host "Minifilter instance: '$defaultInstance' (altitude $altitude)"
 
 Write-Host "Starting '$ServiceName'..."
 & sc.exe start $ServiceName | Out-Host

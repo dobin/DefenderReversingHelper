@@ -89,9 +89,23 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $Output = Join-Path $Root "bin\$Configuration"
+
+# Keep the INF next to the .sys so the package can be installed/signed from
+# the output directory.  The driver project also has a post-build copy; this
+# keeps scripts\Build.ps1 self-contained.
+$Inf = Join-Path $Root 'driver\MakeMePPL.inf'
+if (Test-Path $Inf) {
+    Copy-Item -Path $Inf -Destination (Join-Path $Output 'MakeMePPL.inf') -Force
+}
+
+# A catalog from the previous build hashes the old .sys.  Remove it so nobody
+# installs a mismatched package; Sign-Driver.ps1 regenerates and signs it after
+# the new binary is signed.
+Remove-Item -Path (Join-Path $Output 'MakeMePPL.cat') -Force -ErrorAction SilentlyContinue
+
 Write-Host ''
 Write-Host "Build succeeded. Output: $Output"
 Get-ChildItem $Output -File |
-    Where-Object { $_.Extension -in '.sys', '.exe', '.dll' } |
+    Where-Object { $_.Extension -in '.sys', '.exe', '.dll', '.inf', '.cat' } |
     Select-Object Name, Length |
     Format-Table -AutoSize
