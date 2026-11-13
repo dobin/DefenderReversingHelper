@@ -1,6 +1,8 @@
 #pragma once
 
+#if !defined(_NTDDK_) && !defined(_NTIFS_)
 #include <ntddk.h>
+#endif
 
 //
 // All driver diagnostics go to the kernel debugger / DebugView. The driver

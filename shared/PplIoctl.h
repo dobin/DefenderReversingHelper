@@ -51,6 +51,7 @@ typedef LONG NTSTATUS;
 #define PPL_INFO_FLAG_NOTIFY_REGISTERED     0x00000001
 #define PPL_INFO_FLAG_OFFSET_SUPPORTED      0x00000002
 #define PPL_INFO_FLAG_MITIGATION_SUPPORTED  0x00000004
+#define PPL_INFO_FLAG_TELEMETRY_ACTIVE      0x00000008
 
 //
 // EPROCESS!MitigationFlags bit 23.
@@ -268,5 +269,16 @@ typedef struct _PPL_DRIVER_INFO {
     ULONG MitigationFlags1Offset;
     ULONG MitigationFlags2Offset;
     ULONG ObjectTableOffset;
-    ULONG Reserved;
+    NTSTATUS TelemetryStatus;   // last MpTelemetryInitialize result
+    ULONG TelemetryStage;       // 1..6, which init call was reached
+
+    //
+    // Added with the bounded send path.  Events the driver could not hand to
+    // the consumer (send timeout, cooldown, wrong IRQL), events skipped by the
+    // write-rate budget, and failed sends.  Growing send drops mean the
+    // consumer is not draining fast enough.
+    //
+    ULONG TelemetryDropped;
+    ULONG TelemetryWriteSkipped;
+    ULONG TelemetrySendFailures;
 } PPL_DRIVER_INFO, *PPPL_DRIVER_INFO;

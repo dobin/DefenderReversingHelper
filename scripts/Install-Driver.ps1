@@ -37,14 +37,41 @@ if ($testSigning -notmatch 'testsigning\s+Yes') {
 
 Write-Host "Stopping/deleting any existing service '$ServiceName'..."
 & sc.exe stop $ServiceName | Out-Host
+for ($i = 0; $i -lt 100; $i++) {
+    $query = (& sc.exe query $ServiceName 2>&1) -join "`n"
+    if ($query -match 'STOPPED' -or $query -match '1060') {
+        break
+    }
+    Start-Sleep -Milliseconds 200
+}
 & sc.exe delete $ServiceName | Out-Host
 Start-Sleep -Milliseconds 500
 
 Write-Host "Creating '$ServiceName' -> $DriverPath"
-& sc.exe create $ServiceName type= kernel start= demand error= normal binPath= "`"$DriverPath`""
+& sc.exe create $ServiceName type= filesys start= demand error= normal group= "FSFilter Anti-Virus" depend= FltMgr binPath= "`"$DriverPath`""
 if ($LASTEXITCODE -ne 0) {
     throw "sc.exe create failed with exit code $LASTEXITCODE."
 }
+
+#
+# Register a default minifilter instance.  MakeMePPL now also hosts the
+# WdFilter-style telemetry source (MpTelemetry.c); FltRegisterFilter needs a
+# DefaultInstance plus an altitude entry under the service key.  These are
+# normally written by a minifilter INF.  Every other minifilter on the system
+# (WdFilter, FileInfo, FileCrypt, bindflt) has the same shape.
+#
+$serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+$instancesKey = Join-Path $serviceKey 'Instances'
+$instanceKey = Join-Path $instancesKey "$ServiceName Instance"
+New-Item -Path $instanceKey -Force | Out-Null
+New-ItemProperty -Path $instancesKey -Name 'DefaultInstance' `
+    -Value "$ServiceName Instance" -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $instanceKey -Name 'Altitude' -Value '328500' `
+    -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $instanceKey -Name 'Flags' -Value 0 `
+    -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name 'SupportedFeatures' -Value 15 `
+    -PropertyType DWord -Force | Out-Null
 
 Write-Host "Starting '$ServiceName'..."
 & sc.exe start $ServiceName | Out-Host

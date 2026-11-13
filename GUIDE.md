@@ -37,6 +37,9 @@ Vibe coded by Deepseek V4.1 Flash. With input from https://github.com/hfiref0x/K
 - Blocklist for system-critical processes
 - Best-effort restore of tracked processes on `clear` and driver unload
 - `probe` black-box acceptance test using `OpenProcess` after enabling `SeDebugPrivilege`
+- **Kernel telemetry:** a WdFilter-style minifilter source on
+  `\MpEngineTelemetryPort`; `MpTelemetry.c` sends file/process events to the
+  `mpengine_client.exe agent` consumer in the mpclient repository
 
 The driver's control device is writable by all local users, and it never opens a network
 socket, writes files, or persists state. Driver installation and removal still require an
@@ -50,9 +53,13 @@ ppl_executor/
   MakeMePPL.sln
   shared/PplIoctl.h             shared IOCTLs and structs
   shared/PplBuilds.c/.h         NT build numbers + EPROCESS offset table
+  shared/MpTelemetry.h          WdFilter-style wire protocol (kernel + user)
   driver/
     MakeMePPL.vcxproj
     MakeMePPL.c               DriverEntry, control device, IOCTL dispatch
+    MpTelemetry.c/.h            minifilter, port, process/file telemetry
+    MpTelemetryFile.c           minifilter operation callbacks
+    MpTelemetryInternal.h       shared driver telemetry state
     PplProtection.c/.h          PPL byte: set/clear/query, verification
     PplMitigation.c/.h          DLL signature mitigation: allow-dlls, restore
     PplTrack.c/.h               shared change-tracking table and lock
@@ -90,6 +97,8 @@ ppl_executor/
     Enable-TestSigning.ps1
     Install-Driver.ps1
     Uninstall-Driver.ps1
+  docs/
+    mp_telemetry.md              WdFilter analysis + wire protocol
 ```
 
 `bin/<Configuration>/` is the common output directory.
@@ -202,8 +211,13 @@ Run these in an elevated PowerShell.
    .\scripts\Uninstall-Driver.ps1
    ```
 
-   `sc stop` invokes `DriverUnload`, which unregisters the process callback and restores
-   tracked processes. Close broker/CLI windows first.
+   `sc stop` is a mandatory unload: the filter manager calls the minifilter's
+   `FilterUnloadCallback`, which runs `PplDriverTeardown` (unregister the
+   telemetry filter and process callback, restore tracked processes, delete the
+   control device). `DriverUnload` then runs the same idempotent teardown. Close
+   broker/CLI windows first so the control device is not held open. Without a
+   `FilterUnloadCallback` a minifilter is not unloadable at all and `sc stop`
+   fails with `ERROR_INVALID_SERVICE_CONTROL`.
 
 ## Quick start
 
@@ -241,6 +255,28 @@ MicrosoftSignedOnly=1)` at runtime.
 
 `allow-dynamic-code` clears `MitigationFlags` bit 8 (`DisableDynamicCode`, ACG). It is
 also tracked, and `clear --pid` restores it together with any `allow-dlls` change.
+
+`clear` only undoes protection the driver applied. A process that was protected by
+someone else (for example `MsMpEng.exe`, protected at boot by Defender) has no track
+entry and returns `STATUS_ACCESS_DENIED` with `old == new`. Use `clear --pid <pid>
+--force` to remove that protection anyway; the removed byte is recorded, so a later
+plain `clear --pid <pid>` puts it back.
+
+To restart a protected process, use `kill` instead of `Stop-Process`:
+
+```powershell
+# Elevated for SYSTEM-owned processes
+.\bin\Release\PplCtl.exe kill --pid <pid> --wait
+```
+
+`kill` force-clears PPL (when needed), opens the process with `PROCESS_TERMINATE`,
+repairs `GrantedAccess` through the handle-table primitive, and terminates it. Clearing
+PPL alone is not enough: a product that registers `ObRegisterCallbacks` strips
+`PROCESS_TERMINATE` from your handle without failing the open, so `TerminateProcess`
+still returns `ERROR_ACCESS_DENIED`. If the open or the terminate fails, the driver's
+tracked original protection is restored. `--wait [seconds]` polls for the same image
+name and reports the new PID; the service manager restarts protected services such as
+`WinDefend` automatically. See [Troubleshooting](#troubleshooting).
 
 Protect every new `test_` image automatically:
 
@@ -384,7 +420,8 @@ For name filters, the on-connect broker, other signers, and all CLI options, see
 ```text
 pplctl info
 pplctl set   --pid <pid> [--signer am|wintcb|windows|lsa|authenticode|codegen|winsystem|app] [--audit]
-pplctl clear --pid <pid>
+pplctl clear --pid <pid> [--force]
+pplctl kill  --pid <pid> [--wait [seconds]]
 pplctl query --pid <pid>
 pplctl probe --pid <pid>
 pplctl allow-dlls --pid <pid>
@@ -576,6 +613,15 @@ change. `allow-dynamic-code` should change the ACG line to `off`.
 - `injector.exe` reports `OpenProcess failed (error 5)` - run it elevated. For a protected
   target such as `MsMpEng.exe`, pass `--ppl` so protection is cleared before
   `OpenProcess`; `--fix-handle` only repairs an existing handle.
+- `pplctl clear` returns `STATUS_ACCESS_DENIED` with `old == new` - the process was
+  protected by something other than the driver (for example `MsMpEng.exe` at boot), so
+  there is nothing tracked to restore. Add `--force` if the target really has to be
+  unprotected.
+- `Stop-Process` or `TerminateProcess` returns access denied after `clear --force` -
+  clearing `PS_PROTECTION` removes the PPL check but not a product's
+  `ObRegisterCallbacks`, which strips `PROCESS_TERMINATE` from new handles. Use
+  `pplctl kill --pid <pid>`, which repairs the handle before terminating, and run it
+  elevated for SYSTEM-owned processes.
 - `CreateRemoteThread` fails or `LoadLibraryW` returns `NULL` - try `--kernel-thread`
   (protected-process thread check) and `--ppl` (PPL and blockdll mitigation).
 - `injector.exe` reports `Could not open \\.\MakeMePPL` - the driver is not loaded, or the

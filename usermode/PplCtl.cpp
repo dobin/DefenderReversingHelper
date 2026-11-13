@@ -2,6 +2,7 @@
 #include "PplBuilds.h"
 
 #include <sddl.h>
+#include <tlhelp32.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,7 @@ PrintUsage()
         L"  pplctl info\n"
         L"  pplctl set   --pid <pid> [--signer am|wintcb|windows|lsa|authenticode|codegen|winsystem|app] [--audit]\n"
         L"  pplctl clear --pid <pid> [--force]\n"
+        L"  pplctl kill  --pid <pid> [--wait [seconds]]\n"
         L"  pplctl query --pid <pid>\n"
         L"  pplctl probe --pid <pid>\n"
         L"  pplctl allow-dlls --pid <pid>\n"
@@ -52,6 +54,9 @@ PrintUsage()
         L"make image code pages writable. Both changes are tracked for clear/restore.\n"
         L"clear --force removes PPL from a process this driver did not protect; the byte is\n"
         L"tracked, so set+clear restores it. Use only in an isolated test VM.\n"
+        L"kill force-clears PPL, repairs the handle access a protection callback stripped, and\n"
+        L"terminates the process. --wait polls for the image to come back (for example after the\n"
+        L"service manager restarts a protected service). Run it elevated for SYSTEM processes.\n"
         L"Driver installation/removal requires an elevated console; pplctl commands work for any local user.\n"
         L"The control device is writable by all local users, so any local process can grant or clear PPL.\n"
         L"Broker defaults to an Everyone-writable PPL grant pipe (--allow-all); use it only in an isolated test VM.\n"
@@ -323,6 +328,37 @@ CommandInfo()
                  (info.Flags & PPL_INFO_FLAG_NOTIFY_REGISTERED)
                      ? L"registered"
                      : L"not registered");
+    std::wprintf(L"telemetry      : %s\n",
+                 (info.Flags & PPL_INFO_FLAG_TELEMETRY_ACTIVE)
+                     ? L"minifilter active (\\MpEngineTelemetryPort)"
+                     : L"unavailable");
+    if (info.Flags & PPL_INFO_FLAG_TELEMETRY_ACTIVE) {
+        std::wprintf(L"telemetry drops: %lu send drops, %lu rate-limited "
+                     L"writes, %lu send failures\n",
+                     static_cast<unsigned long>(info.TelemetryDropped),
+                     static_cast<unsigned long>(info.TelemetryWriteSkipped),
+                     static_cast<unsigned long>(info.TelemetrySendFailures));
+    }
+    if (!(info.Flags & PPL_INFO_FLAG_TELEMETRY_ACTIVE) &&
+        info.TelemetryStatus != 0) {
+        std::wprintf(L"telemetry code : 0x%08lX\n",
+                     static_cast<unsigned long>(info.TelemetryStatus));
+    }
+    if (!(info.Flags & PPL_INFO_FLAG_TELEMETRY_ACTIVE)) {
+        const wchar_t* stage = L"unknown";
+
+        switch (info.TelemetryStage) {
+        case 1: stage = L"ExInitializeResourceLite"; break;
+        case 2: stage = L"FltRegisterFilter"; break;
+        case 3: stage = L"security descriptor"; break;
+        case 4: stage = L"FltCreateCommunicationPort"; break;
+        case 5: stage = L"FltStartFiltering"; break;
+        case 6: stage = L"PsSetCreateProcessNotifyRoutineEx"; break;
+        default: break;
+        }
+        std::wprintf(L"telemetry stage: %s (%lu)\n", stage,
+                     static_cast<unsigned long>(info.TelemetryStage));
+    }
 
     return PplNtSuccess(info.Status) ? 0 : 1;
 }
@@ -659,6 +695,263 @@ CommandClear(int argc, wchar_t** argv)
     std::wprintf(L"\n");
 
     return PplNtSuccess(result.Status) ? 0 : 1;
+}
+
+std::wstring
+ImageBaseName(
+    _In_ const wchar_t* Path)
+{
+    std::wstring name = (Path != nullptr) ? Path : L"";
+    size_t slash = name.find_last_of(L"\\/");
+
+    return (slash == std::wstring::npos) ? name : name.substr(slash + 1);
+}
+
+ULONG
+FindProcessIdByImageName(
+    _In_ const std::wstring& BaseName,
+    _In_ ULONG ExcludeProcessId)
+{
+    HANDLE snapshot;
+    PROCESSENTRY32W entry = {};
+
+    if (BaseName.empty()) {
+        return 0;
+    }
+
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID != ExcludeProcessId &&
+                _wcsicmp(entry.szExeFile, BaseName.c_str()) == 0) {
+                CloseHandle(snapshot);
+                return entry.th32ProcessID;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return 0;
+}
+
+//
+// Force-clears PPL if needed, then repairs the caller's handle access before
+// terminating. Defender-style self-protection lowers DesiredAccess at handle
+// creation, so TerminateProcess fails even after PPL is gone; the handle-table
+// repair is the same primitive the injector uses for VM_WRITE/CREATE_THREAD.
+//
+void
+RestoreTrackedProtection(
+    _In_ HANDLE Device,
+    _In_ ULONG ProcessId)
+{
+    DWORD returned = 0;
+    PPL_OPERATION_RESULT restore = {};
+
+    if (Device != INVALID_HANDLE_VALUE &&
+        PplIoctl(Device, IOCTL_PPL_CLEAR_BY_PID,
+                 &ProcessId, sizeof(ProcessId),
+                 &restore, sizeof(restore), &returned)) {
+        std::wprintf(L"[+] PPL restored: 0x%02X -> 0x%02X\n",
+                     static_cast<unsigned>(restore.OldProtection),
+                     static_cast<unsigned>(restore.NewProtection));
+    } else {
+        std::fwprintf(stderr,
+                      L"[!] could not restore PPL; run: pplctl clear --pid %lu\n",
+                      ProcessId);
+    }
+}
+
+int
+CommandKill(int argc, wchar_t** argv)
+{
+    ULONG processId = 0;
+    ULONG waitSeconds = 0;
+    bool havePid = false;
+    PPL_QUERY_RESULT query = {};
+    PPL_OPERATION_RESULT clear = {};
+    PPL_HANDLE_FIX_REQUEST fix = {};
+    PPL_HANDLE_FIX_RESULT fixed = {};
+    HANDLE device;
+    HANDLE process;
+    DWORD returned = 0;
+    bool cleared = false;
+    wchar_t imagePath[MAX_PATH] = {};
+    DWORD imageLength = MAX_PATH;
+    std::wstring baseName;
+
+    for (int i = 2; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--pid") == 0 && i + 1 < argc) {
+            havePid = ParseUlong(argv[++i], &processId);
+            if (!havePid) {
+                std::fwprintf(stderr, L"Invalid --pid value.\n");
+                return 2;
+            }
+        } else if (_wcsicmp(argv[i], L"--wait") == 0) {
+            waitSeconds = 15;
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                if (!ParseUlong(argv[++i], &waitSeconds)) {
+                    std::fwprintf(stderr, L"Invalid --wait value.\n");
+                    return 2;
+                }
+            }
+        } else {
+            std::fwprintf(stderr, L"Unknown option '%s'.\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (!havePid) {
+        std::fwprintf(stderr, L"kill requires --pid <pid>.\n");
+        return 2;
+    }
+
+    if (processId == 0 || processId == 4) {
+        std::fwprintf(stderr, L"Refusing to kill PID %lu.\n", processId);
+        return 1;
+    }
+
+    device = PplOpenDevice();
+    if (device == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+
+    //
+    // Query first so an unprotected process does not get a needless track
+    // entry, and so the clear that follows is reported accurately.
+    //
+    if (PplIoctl(device, IOCTL_PPL_QUERY_BY_PID,
+                 &processId, sizeof(processId),
+                 &query, sizeof(query), &returned, true) &&
+        PplNtSuccess(query.Status) && query.Protection != 0) {
+        if (!PplIoctl(device, IOCTL_PPL_FORCE_CLEAR_BY_PID,
+                      &processId, sizeof(processId),
+                      &clear, sizeof(clear), &returned)) {
+            CloseHandle(device);
+            return 1;
+        }
+        if (!PplNtSuccess(clear.Status)) {
+            std::fwprintf(stderr, L"force-clear pid %lu failed: %s (0x%08lX)\n",
+                          processId,
+                          PplNtStatusText(clear.Status).c_str(),
+                          static_cast<unsigned long>(clear.Status));
+            CloseHandle(device);
+            return 1;
+        }
+
+        cleared = true;
+        std::wprintf(L"[+] PPL cleared  : 0x%02X -> 0x%02X\n",
+                     static_cast<unsigned>(clear.OldProtection),
+                     static_cast<unsigned>(clear.NewProtection));
+    }
+
+    process = OpenProcess(
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE, processId);
+    if (process == nullptr) {
+        DWORD error = GetLastError();
+
+        std::fwprintf(stderr, L"OpenProcess(%lu) failed: %lu (%s)\n",
+                      processId, error, Win32ErrorText(error).c_str());
+
+        if (cleared) {
+            RestoreTrackedProtection(device, processId);
+        }
+
+        if (error == ERROR_ACCESS_DENIED) {
+            std::fwprintf(stderr,
+                          L"    SYSTEM-owned processes need an elevated console.\n");
+        }
+
+        CloseHandle(device);
+        return 1;
+    }
+
+    if (QueryFullProcessImageNameW(process, 0, imagePath, &imageLength)) {
+        baseName = ImageBaseName(imagePath);
+    }
+
+    //
+    // Repair the handle even when the open succeeded: a protection callback
+    // may have removed PROCESS_TERMINATE from GrantedAccess without failing
+    // the open. Access=0 was already verified by the driver.
+    //
+    fix.ProcessId = processId;
+    fix.AccessMask = PROCESS_ALL_ACCESS;
+    fix.HandleValue = static_cast<ULONG64>(
+        reinterpret_cast<ULONG_PTR>(process));
+
+    if (PplIoctl(device, IOCTL_PPL_FIX_HANDLE_ACCESS,
+                 &fix, sizeof(fix),
+                 &fixed, sizeof(fixed), &returned) &&
+        PplNtSuccess(fixed.Status)) {
+        std::wprintf(L"[+] handle access: 0x%08lX -> 0x%08lX\n",
+                     static_cast<unsigned long>(fixed.OldGrantedAccess),
+                     static_cast<unsigned long>(fixed.NewGrantedAccess));
+    } else {
+        std::fwprintf(stderr,
+                      L"[!] handle repair failed (0x%08lX); trying anyway\n",
+                      static_cast<unsigned long>(fixed.Status));
+    }
+
+    CloseHandle(device);
+
+    if (!TerminateProcess(process, 0)) {
+        DWORD error = GetLastError();
+
+        std::fwprintf(stderr, L"TerminateProcess(%lu) failed: %lu (%s)\n",
+                      processId, error, Win32ErrorText(error).c_str());
+        if (cleared) {
+            RestoreTrackedProtection(device, processId);
+        }
+        CloseHandle(process);
+        CloseHandle(device);
+        return 1;
+    }
+
+    CloseHandle(device);
+
+    (void)WaitForSingleObject(process, 5000);
+    CloseHandle(process);
+
+    if (baseName.empty()) {
+        std::wprintf(L"terminated pid %lu\n", processId);
+    } else {
+        std::wprintf(L"terminated pid %lu (%s)\n",
+                     processId, baseName.c_str());
+    }
+
+    if (waitSeconds != 0 && !baseName.empty()) {
+        ULONG newPid = 0;
+        ULONG waited = 0;
+
+        std::wprintf(L"waiting up to %lu s for %s to come back...\n",
+                     waitSeconds, baseName.c_str());
+
+        while (waited < waitSeconds * 1000) {
+            newPid = FindProcessIdByImageName(baseName, processId);
+            if (newPid != 0) {
+                break;
+            }
+            Sleep(250);
+            waited += 250;
+        }
+
+        if (newPid != 0) {
+            std::wprintf(L"[+] %s restarted as pid %lu\n",
+                         baseName.c_str(), newPid);
+        } else {
+            std::fwprintf(stderr, L"[!] %s did not come back within %lu s\n",
+                          baseName.c_str(), waitSeconds);
+        }
+    }
+
+    return 0;
 }
 
 void
@@ -1363,6 +1656,10 @@ wmain(
     }
     if (_wcsicmp(argv[1], L"clear") == 0) {
         return CommandClear(argc, argv);
+    }
+    if (_wcsicmp(argv[1], L"kill") == 0 ||
+        _wcsicmp(argv[1], L"terminate") == 0) {
+        return CommandKill(argc, argv);
     }
     if (_wcsicmp(argv[1], L"allow-dlls") == 0) {
         return CommandAllowDlls(argc, argv);

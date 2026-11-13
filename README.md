@@ -5,6 +5,8 @@ A test-signed Windows driver and CLI that grant:
 * Remove the **block non-Microsoft binaries** process mitigation of processes
 * Clear **Arbitrary Code Guard (ACG)** so an in-process Detours hook can patch code
 * DLL inject into `MsMpEng.exe`
+* Emit WdFilter-style file/process **kernel telemetry** over the minifilter
+  communication port `\MpEngineTelemetryPort` for a user-mode consumer
 
 It ships a DLL injector, `bin\Release\injector.exe`, with driver-backed
 `--ppl`, `--allow-dynamic-code`, `--fix-handle`, and `--kernel-thread` options.
@@ -85,6 +87,13 @@ $target = Start-Process .\bin\Release\test_target.exe -PassThru
 `clear` restores the tracked original protection byte and the original DLL
 signature level. Existing handles are not revoked.
 
+To restart a protected process, use `kill` (it force-clears PPL and repairs the
+handle access that self-protection stripped, which `Stop-Process` cannot):
+
+```powershell
+.\bin\Release\PplCtl.exe kill --pid <pid> --wait
+```
+
 ### Inject a DLL
 
 Normal target:
@@ -124,6 +133,45 @@ ETW, start the listener and then inject the Detours payload:
 
 For name filters, the on-connect broker, other signers, and all CLI options, see the
 [command reference and examples](GUIDE.md#quick-start).
+
+## Kernel telemetry source (WdFilter-style)
+
+`MakeMePPL.sys` is also a minifilter. It mirrors the shape of `WdFilter.sys`:
+a filter-manager communication port plus `FltSendMessage` telemetry, a
+process-creation callback, and file callbacks for create/write/cleanup/rename/
+delete. The wire protocol and the WdFilter analysis are documented in
+[docs/mp_telemetry.md](docs/mp_telemetry.md).
+
+The consumer lives in `C:\Data\defender-2026-autumn\mpclient`
+(`mpengine_client.exe agent`). The agent connects to
+`\MpEngineTelemetryPort`, converts the messages into RTP notes and forwards
+them to `mpengine.dll` through `__rsignal`/0x4039, along with its ETW sources.
+
+```powershell
+# Elevated: reload the driver in place (no reboot needed)
+.\scripts\Uninstall-Driver.ps1        # sc stop + sc delete; the unload callback
+                                     # restores tracked protections first
+.\scripts\Install-Driver.ps1
+.\bin\Release\PplCtl.exe info       # telemetry : minifilter active
+
+# Other repository: agent plus kernel telemetry
+cd C:\Data\defender-2026-autumn\mpclient
+.\mpengine_client.exe agent --seconds 10
+.\mpengine_test.exe diag drv --seconds 3 --no-elevate
+```
+
+`Install-Driver.ps1` writes the minifilter `Instances\MakeMePPL Instance`
+altitude/instance registry values between `sc create` and `sc start`.
+`MpTelemetryInitialize` is best effort: if `FltRegisterFilter` or
+`FltStartFiltering` fails, PPL/injection keep working and `PplCtl info`
+reports `telemetry : unavailable`. The port DACL allows any local user,
+consistent with the rest of this test driver; restrict it before using this
+outside an isolated VM.
+
+Because the minifilter registers a `FilterUnloadCallback`, `sc stop` performs a
+full unload instead of requiring a reboot. Close the agent and `PplCtl` first:
+an open handle to the control device keeps the driver image referenced after
+the filter unregisters.
 
 ## More information
 

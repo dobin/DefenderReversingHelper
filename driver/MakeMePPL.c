@@ -2,13 +2,16 @@
 #include <wdmsec.h>
 
 #include "../shared/PplIoctl.h"
+#include "PplDriver.h"
 #include "PplLog.h"
 #include "PplProtection.h"
 #include "PplMitigation.h"
 #include "PplFilter.h"
+#include "MpTelemetry.h"
 
 static PDEVICE_OBJECT g_DeviceObject;
 static BOOLEAN        g_SymlinkCreated;
+static volatile LONG  g_DriverTornDown;
 
 //
 // Class GUID for IoCreateDeviceSecure's administrator-override mechanism.
@@ -103,6 +106,13 @@ PplpDeviceControl(
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         status = STATUS_INVALID_DEVICE_STATE;
+        goto complete;
+    }
+    if (InterlockedCompareExchange(&g_DriverTornDown, 0, 0) != 0) {
+        /* The driver is unloading (sc stop called the filter unload
+         * callback).  A client that still holds the control device open must
+         * not touch state that PplDriverTeardown has already cleared. */
+        status = STATUS_DEVICE_NOT_READY;
         goto complete;
     }
 
@@ -298,6 +308,11 @@ PplpDeviceControl(
         info->MitigationFlags1Offset = g_PplOffsets.PsMitigationFlags1Offset;
         info->MitigationFlags2Offset = g_PplOffsets.PsMitigationFlags2Offset;
         info->ObjectTableOffset = g_PplOffsets.ObjectTableOffset;
+        info->TelemetryStatus = MpTelemetryInitializeStatus();
+        info->TelemetryStage = MpTelemetryInitializeStage();
+        info->TelemetryDropped = (ULONG)MpTelemetryDropped();
+        info->TelemetryWriteSkipped = (ULONG)MpTelemetryWriteSkipped();
+        info->TelemetrySendFailures = (ULONG)MpTelemetrySendFailures();
         info->Flags = (PplFilterNotifyRegistered()
                            ? PPL_INFO_FLAG_NOTIFY_REGISTERED
                            : 0) |
@@ -306,6 +321,9 @@ PplpDeviceControl(
                            : 0) |
                       (g_PplOffsets.PsMitigationFlags1Offset != 0
                            ? PPL_INFO_FLAG_MITIGATION_SUPPORTED
+                           : 0) |
+                      (MpTelemetryIsActive()
+                           ? PPL_INFO_FLAG_TELEMETRY_ACTIVE
                            : 0);
 
         for (j = 0;
@@ -459,12 +477,26 @@ complete:
 }
 
 VOID
-PplUnload(
-    _In_ PDRIVER_OBJECT DriverObject)
+PplDriverTeardown(VOID)
 {
     UNICODE_STRING symbolicLinkName;
 
-    PPL_LOG("unloading");
+    //
+    // A single unload request can reach here twice: the filter manager calls
+    // FilterUnloadCallback and then the original DriverUnload (it keeps the
+    // routine in the FLT_FILTER).  Run the sequence exactly once so the
+    // filter is not unregistered twice and protections are restored once.
+    //
+    if (InterlockedExchange(&g_DriverTornDown, 1) != 0) {
+        return;
+    }
+
+    //
+    // 0. Stop the telemetry minifilter and its process callback first.  This
+    //    unregisters the filter (waiting for in-flight callbacks) and
+    //    disconnects the user-mode consumer before the rest is torn down.
+    //
+    MpTelemetryShutdown();
 
     //
     // 1. Stop new callback invocations and wait for in-flight callbacks.
@@ -499,7 +531,14 @@ PplUnload(
     // 5. Clear state.
     //
     PplFilterShutdown();
+}
 
+VOID
+PplUnload(
+    _In_ PDRIVER_OBJECT DriverObject)
+{
+    PPL_LOG("unloading (DriverUnload)");
+    PplDriverTeardown();
     UNREFERENCED_PARAMETER(DriverObject);
 }
 
@@ -548,6 +587,15 @@ DriverEntry(
     // on-connect grants continue to work.
     //
     (VOID)PplFilterRegisterNotify();
+
+    //
+    // WdFilter-style telemetry source.  Like the name filter above, a failure
+    // only disables this feature; PPL and injection keep working.
+    //
+    status = MpTelemetryInitialize(DriverObject);
+    if (!NT_SUCCESS(status)) {
+        PPL_LOG("telemetry source unavailable: 0x%08X", status);
+    }
 
     PPL_LOG("loaded, build %lu (%ws), PPL offset 0x%03lX",
             g_PplBuildNumber,

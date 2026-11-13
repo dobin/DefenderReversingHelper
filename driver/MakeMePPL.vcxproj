@@ -74,7 +74,7 @@
       <PreprocessorDefinitions>_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <SubSystem>Native</SubSystem>
     </Link>
@@ -82,6 +82,8 @@
 
   <ItemGroup>
     <ClCompile Include="MakeMePPL.c" />
+    <ClCompile Include="MpTelemetry.c" />
+    <ClCompile Include="MpTelemetryFile.c" />
     <ClCompile Include="PplFilter.c" />
     <ClCompile Include="PplMitigation.c" />
     <ClCompile Include="PplProtection.c" />
@@ -91,10 +93,14 @@
 
   <ItemGroup>
     <ClInclude Include="PplFilter.h" />
+    <ClInclude Include="PplDriver.h" />
+    <ClInclude Include="MpTelemetry.h" />
+    <ClInclude Include="MpTelemetryInternal.h" />
     <ClInclude Include="PplLog.h" />
     <ClInclude Include="PplMitigation.h" />
     <ClInclude Include="PplProtection.h" />
     <ClInclude Include="PplTrack.h" />
+    <ClInclude Include="..\shared\MpTelemetry.h" />
     <ClInclude Include="..\shared\PplBuilds.h" />
     <ClInclude Include="..\shared\PplIoctl.h" />
   </ItemGroup>
