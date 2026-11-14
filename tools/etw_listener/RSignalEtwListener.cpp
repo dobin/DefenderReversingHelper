@@ -45,8 +45,11 @@ namespace {
 struct Options {
     std::wstring   session = MPENGINE_ETW_SESSION_NAME;
     std::wstring   outPath;
+    std::wstring   outBinPath;           /* optional framed CALL payload file */
     bool           dump = false;         /* default: sizes only */
     bool           binaryFormat = false; /* --out stores framed binary CALL payloads */
+    bool           jsonlFormat = false;  /* --out stores one JSON object per event */
+    bool           includeContext = false; /* add ContextAddress/Length/Hex to jsonl */
     size_t         dumpBytes = 512;      /* 0 = print everything */
     uint64_t       maxEvents = 0;        /* 0 = unlimited */
     bool           showStatus = true;
@@ -54,6 +57,7 @@ struct Options {
 
 Options                g_options;
 FILE*                  g_out = nullptr;
+FILE*                  g_outBin = nullptr;
 std::mutex             g_outputLock;
 std::atomic<uint64_t>  g_eventCount{ 0 };
 std::atomic<bool>      g_stopRequested{ false };
@@ -97,7 +101,25 @@ Print(
     fputs(Text.c_str(), stdout);
     fflush(stdout);
 
-    if (g_out != nullptr && !g_options.binaryFormat) {
+    /* jsonl output must stay parseable, so only PrintJson writes there. */
+    if (g_out != nullptr && !g_options.binaryFormat &&
+        !g_options.jsonlFormat) {
+        fputs(Text.c_str(), g_out);
+        fflush(g_out);
+    }
+}
+
+/* Write a JSON record to stdout and to the --out file. */
+void
+PrintJson(
+    _In_ const std::string& Text)
+{
+    std::lock_guard<std::mutex> lock(g_outputLock);
+
+    fputs(Text.c_str(), stdout);
+    fflush(stdout);
+
+    if (g_out != nullptr) {
         fputs(Text.c_str(), g_out);
         fflush(g_out);
     }
@@ -105,11 +127,12 @@ Print(
 
 bool
 WriteBinaryEvent(
+    _In_ FILE* Target,
     _In_ uint32_t SignalId,
     _In_reads_bytes_(PayloadSize) const BYTE* Payload,
     _In_ uint32_t PayloadSize)
 {
-    if (g_out == nullptr) {
+    if (Target == nullptr) {
         return false;
     }
 
@@ -123,12 +146,29 @@ WriteBinaryEvent(
     };
 
     std::lock_guard<std::mutex> lock(g_outputLock);
-    if (fwrite(header, sizeof(header), 1, g_out) != 1 ||
-        (PayloadSize != 0 && fwrite(Payload, PayloadSize, 1, g_out) != 1)) {
+    if (fwrite(header, sizeof(header), 1, Target) != 1 ||
+        (PayloadSize != 0 && fwrite(Payload, PayloadSize, 1, Target) != 1)) {
         return false;
     }
 
-    return fflush(g_out) == 0;
+    return fflush(Target) == 0;
+}
+
+/* Wall-clock FILETIME for an event, or 0 when the QPC anchor is not ready. */
+uint64_t
+WallClockTimestamp(
+    _In_ const EVENT_RECORD& Record)
+{
+    ULONGLONG ticks = (ULONGLONG)Record.EventHeader.TimeStamp.QuadPart;
+
+    if (g_qpcFrequency == 0 || g_wallClockBase == 0 ||
+        ticks < (ULONGLONG)g_qpcBase.QuadPart) {
+        return 0;
+    }
+
+    return g_wallClockBase +
+           ((ticks - (ULONGLONG)g_qpcBase.QuadPart) * 10000000ull) /
+               g_qpcFrequency;
 }
 
 std::string
@@ -138,16 +178,7 @@ FormatTimestamp(
     FILETIME   fileTime;
     FILETIME   localTime;
     SYSTEMTIME systemTime;
-    ULONGLONG  ticks = (ULONGLONG)Record.EventHeader.TimeStamp.QuadPart;
-    ULONGLONG  timestamp = 0;
-
-    if (g_qpcFrequency != 0 && g_wallClockBase != 0 &&
-        ticks >= (ULONGLONG)g_qpcBase.QuadPart) {
-        ULONGLONG delta = ticks - (ULONGLONG)g_qpcBase.QuadPart;
-
-        timestamp = g_wallClockBase +
-                    (delta * 10000000ull) / g_qpcFrequency;
-    }
+    ULONGLONG  timestamp = WallClockTimestamp(Record);
 
     if (timestamp == 0) {
         GetLocalTime(&systemTime);
@@ -326,6 +357,34 @@ ConsoleHandler(
 /* Event handling                                                            */
 /* ------------------------------------------------------------------------- */
 
+std::string
+JsonEscape(
+    _In_ const std::string& Text)
+{
+    std::string escaped;
+
+    escaped.reserve(Text.size() + 8);
+
+    for (char value : Text) {
+        switch (value) {
+        case '"':  escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\n': escaped += "\\n";  break;
+        case '\r': escaped += "\\r";  break;
+        case '\t': escaped += "\\t";  break;
+        default:
+            if ((unsigned char)value < 0x20) {
+                escaped += Format("\\u%04x", (unsigned int)(unsigned char)value);
+            } else {
+                escaped += value;
+            }
+            break;
+        }
+    }
+
+    return escaped;
+}
+
 void
 HandleStatusEvent(
     _In_ krabs::parser& Parser,
@@ -338,7 +397,7 @@ HandleStatusEvent(
     Parser.try_parse(L"Code", code);
     Parser.try_parse(L"Message", message);
 
-    if (!g_options.showStatus) {
+    if (!g_options.showStatus && !g_options.jsonlFormat) {
         return;
     }
 
@@ -349,6 +408,18 @@ HandleStatusEvent(
         level = "warn";
     }
 
+    if (g_options.jsonlFormat) {
+        PrintJson(Format("{\"k\":\"status\",\"ts\":%llu,\"pid\":%lu,\"tid\":%lu,"
+                         "\"level\":\"%s\",\"code\":%lu,\"message\":\"%s\"}\n",
+                         (unsigned long long)WallClockTimestamp(Record),
+                         (unsigned long)Record.EventHeader.ProcessId,
+                         (unsigned long)Record.EventHeader.ThreadId,
+                         level,
+                         (unsigned long)code,
+                         JsonEscape(message).c_str()));
+        return;
+    }
+
     Print(Format("%s STATUS(%s) code=%lu (0x%08lX) message=\"%s\"\n",
                  Prefix.c_str(), level, (unsigned long)code,
                  (unsigned long)code, message.c_str()));
@@ -357,6 +428,7 @@ HandleStatusEvent(
 void
 HandleCallEvent(
     _In_ krabs::parser& Parser,
+    _In_ const EVENT_RECORD& Record,
     _In_ const std::string& Prefix)
 {
     int32_t     signal = 0;
@@ -373,18 +445,77 @@ HandleCallEvent(
     Parser.try_parse(L"DataAddress", dataAddress);
     Parser.try_parse(L"DataLength", dataLength);
 
+    const bool needHex = g_options.dump || g_options.binaryFormat ||
+                         !g_options.outBinPath.empty();
     bool hexOk = true;
 
-    if (g_options.dump || g_options.binaryFormat) {
+    if (needHex) {
         hexOk = Parser.try_parse(L"DataHex", dataHex) &&
                 HexDecode(dataHex, dataBytes);
     }
 
-    if (g_options.binaryFormat && hexOk) {
-        if (!WriteBinaryEvent((uint32_t)signal, dataBytes.data(),
-                              (uint32_t)dataBytes.size())) {
+    if (g_options.binaryFormat) {
+        if (hexOk && !WriteBinaryEvent(g_out, (uint32_t)signal,
+                                       dataBytes.data(),
+                                       (uint32_t)dataBytes.size())) {
             fprintf(stderr, "failed to write binary event\n");
         }
+    }
+    if (!g_options.outBinPath.empty()) {
+        if (hexOk && !WriteBinaryEvent(g_outBin, (uint32_t)signal,
+                                       dataBytes.data(),
+                                       (uint32_t)dataBytes.size())) {
+            fprintf(stderr, "failed to write framed event\n");
+        }
+    }
+    if (!hexOk && !g_options.outBinPath.empty()) {
+        fprintf(stderr, "seq=%lu: could not decode DataHex; frame not "
+                        "written\n", (unsigned long)sequence);
+    }
+
+    /*
+     * JSONL carries the same metadata the in-process recorder writes, so a
+     * Defender capture and an mpclient capture have an identical sidecar and
+     * the .bin frames stay the only payload source.
+     */
+    if (g_options.jsonlFormat) {
+        std::string line = Format(
+            "{\"k\":\"call\",\"i\":%lu,\"seq\":%lu,\"ts\":%llu,"
+            "\"pid\":%lu,\"tid\":%lu,\"signal\":\"0x%X\",\"flags\":%lu,"
+            "\"dump\":%lu,\"addr\":%llu",
+            (unsigned long)sequence,
+            (unsigned long)sequence,
+            (unsigned long long)WallClockTimestamp(Record),
+            (unsigned long)Record.EventHeader.ProcessId,
+            (unsigned long)Record.EventHeader.ThreadId,
+            (unsigned int)signal,
+            (unsigned long)(uint32_t)flags,
+            (unsigned long)dataLength,
+            (unsigned long long)dataAddress);
+
+        if (g_options.includeContext) {
+            uint32_t          contextLength = 0;
+            uint64_t          contextAddress = 0;
+            std::string       contextHex;
+            std::vector<BYTE> contextBytes;
+
+            Parser.try_parse(L"ContextAddress", contextAddress);
+            Parser.try_parse(L"ContextLength", contextLength);
+
+            if (Parser.try_parse(L"ContextHex", contextHex)) {
+                (void)HexDecode(contextHex, contextBytes);
+            }
+
+            line += Format(",\"ctx_addr\":%llu,\"ctx_len\":%lu,"
+                           "\"ctx_hex\":\"%s\"",
+                           (unsigned long long)contextAddress,
+                           (unsigned long)contextLength,
+                           contextHex.c_str());
+        }
+
+        line += "}\n";
+        PrintJson(line);
+        return;
     }
 
     std::string text;
@@ -432,6 +563,7 @@ HandleCallEvent(
 void
 HandleReturnEvent(
     _In_ krabs::parser& Parser,
+    _In_ const EVENT_RECORD& Record,
     _In_ const std::string& Prefix)
 {
     uint32_t sequence = 0;
@@ -439,6 +571,18 @@ HandleReturnEvent(
 
     Parser.try_parse(L"SeqNum", sequence);
     Parser.try_parse(L"Status", status);
+
+    if (g_options.jsonlFormat) {
+        PrintJson(Format("{\"k\":\"ret\",\"i\":%lu,\"seq\":%lu,\"ts\":%llu,"
+                         "\"pid\":%lu,\"tid\":%lu,\"status\":%lu}\n",
+                         (unsigned long)sequence,
+                         (unsigned long)sequence,
+                         (unsigned long long)WallClockTimestamp(Record),
+                         (unsigned long)Record.EventHeader.ProcessId,
+                         (unsigned long)Record.EventHeader.ThreadId,
+                         (unsigned long)status));
+        return;
+    }
 
     Print(Format("%s seq=%lu RETURN status=0x%08lX\n",
                  Prefix.c_str(),
@@ -469,10 +613,10 @@ OnEvent(
 
         switch (type) {
         case MPENGINE_ETW_TYPE_CALL:
-            HandleCallEvent(parser, prefix);
+            HandleCallEvent(parser, Record, prefix);
             break;
         case MPENGINE_ETW_TYPE_RETURN:
-            HandleReturnEvent(parser, prefix);
+            HandleReturnEvent(parser, Record, prefix);
             break;
         case MPENGINE_ETW_TYPE_STATUS:
             HandleStatusEvent(parser, Record, prefix);
@@ -511,8 +655,12 @@ Usage(void)
         "\n"
         "  --session <name>   real-time ETW session name\n"
         "  --out <file>       write rendered text (or binary records) to <file>\n"
-        "  --format <format>  output format: text (default) or binary\n"
+        "  --out-bin <file>   also write every CALL payload as framed records;\n"
+        "                     combine with --format jsonl for one aligned pair\n"
+        "  --format <format>  output format: text (default), binary or jsonl\n"
         "                     binary writes CALL payloads as EV + signal ID + size + data\n"
+        "                     jsonl writes one JSON object per CALL/RETURN/Status event\n"
+        "  --context          jsonl: also emit ContextAddress/Length/Hex\n"
         "  --dump             print a hex+ASCII dump of the data buffer\n"
         "  --dump-bytes <n>   bytes of the buffer to dump (implies --dump;\n"
         "                     0 = all, default 512)\n"
@@ -575,6 +723,13 @@ ParseOptions(
                 return false;
             }
             g_options.outPath = value;
+        } else if (argument == L"--out-bin") {
+            const wchar_t* value = next(L"--out-bin");
+
+            if (value == nullptr) {
+                return false;
+            }
+            g_options.outBinPath = value;
         } else if (argument == L"--format") {
             const wchar_t* value = next(L"--format");
 
@@ -583,12 +738,20 @@ ParseOptions(
             }
             if (_wcsicmp(value, L"text") == 0) {
                 g_options.binaryFormat = false;
+                g_options.jsonlFormat = false;
             } else if (_wcsicmp(value, L"binary") == 0) {
                 g_options.binaryFormat = true;
+                g_options.jsonlFormat = false;
+            } else if (_wcsicmp(value, L"jsonl") == 0) {
+                g_options.binaryFormat = false;
+                g_options.jsonlFormat = true;
             } else {
-                fprintf(stderr, "invalid --format (expected text or binary)\n");
+                fprintf(stderr, "invalid --format (expected text, binary or "
+                                "jsonl)\n");
                 return false;
             }
+        } else if (argument == L"--context") {
+            g_options.includeContext = true;
         } else if (argument == L"--dump") {
             g_options.dump = true;
         } else if (argument == L"--no-dump") {
@@ -639,10 +802,20 @@ wmain(
     }
 
     if (!g_options.outPath.empty()) {
-        const wchar_t* mode = g_options.binaryFormat ? L"wb" : L"w";
+        const wchar_t* mode = (g_options.binaryFormat || g_options.jsonlFormat)
+                                  ? L"wb"
+                                  : L"w";
         if (_wfopen_s(&g_out, g_options.outPath.c_str(), mode) != 0 ||
             g_out == nullptr) {
             fprintf(stderr, "cannot open output file\n");
+            return 1;
+        }
+    }
+
+    if (!g_options.outBinPath.empty()) {
+        if (_wfopen_s(&g_outBin, g_options.outBinPath.c_str(), L"wb") != 0 ||
+            g_outBin == nullptr) {
+            fprintf(stderr, "cannot open framed output file\n");
             return 1;
         }
     }
@@ -707,6 +880,11 @@ wmain(
     if (g_out != nullptr) {
         fclose(g_out);
         g_out = nullptr;
+    }
+
+    if (g_outBin != nullptr) {
+        fclose(g_outBin);
+        g_outBin = nullptr;
     }
 
     return traceFailed ? 1 : 0;

@@ -19,7 +19,8 @@ Options:
 |---|---|
 | `--session <name>` | Override the real-time session name |
 | `--out <file>` | Write rendered text or binary records to a file |
-| `--format <text\|binary>` | Output format (`text` is the default; `binary` requires `--out`) |
+| `--format <text\|binary\|jsonl>` | Output format (`text` is the default; `binary` and `jsonl` require `--out`) |
+| `--context` | `jsonl`: also emit `ctx_addr`, `ctx_len` and `ctx_hex` |
 | `--dump` | Print a hex+ASCII dump of the data buffer |
 | `--dump-bytes <n>` | Bytes of the buffer to dump (implies `--dump`; `0` = all, default 512) |
 | `--no-dump` | Compact output (default): signal, flags, data address and size |
@@ -39,6 +40,23 @@ Each CALL is written as a 10-byte little-endian header followed by the raw
 payload: magic `0x5645` (`EV`), 32-bit signal ID, 32-bit payload size, payload.
 Only CALL events are written to the binary file; status and return events are
 still shown in the console output.
+
+For machine-readable captures use `--out rsignal.jsonl --format jsonl`.  Each
+CALL and RETURN is one JSON object, with the same fields the in-process
+recorder in `mpclient` writes (`src/engine/mpengine_signal_record.c`):
+
+```json
+{"k":"call","i":17,"seq":17,"ts":133...,"pid":4321,"tid":8765,
+ "signal":"0x4039","flags":56,"dump":56,"addr":...}
+{"k":"ret","i":17,"seq":17,"ts":133...,"pid":4321,"tid":8765,"status":0}
+```
+
+`flags` is the fourth `__rsignal` argument; it is the logical request size for
+signals that pass a size and must never be confused with `dump`, which is the
+number of bytes the hook managed to copy (up to 4096 regardless of size).
+`--format binary` and `--format jsonl` can be combined across two runs of the
+same activity; `docs/rsignal_comparison.md` in `mpclient` explains why both are
+needed.
 
 The consumer needs to create an ETW session, so run it elevated or as a member
 of **Performance Log Users**. It can start before or after the payload
