@@ -816,6 +816,13 @@ CommandKill(int argc, wchar_t** argv)
         return 1;
     }
 
+    //
+    // OpenProcess with PROCESS_TERMINATE on a SYSTEM-owned service process
+    // needs SeDebugPrivilege to be enabled, not merely present in the token.
+    // An elevated console has it disabled by default.
+    //
+    (void)EnablePrivilege(SE_DEBUG_NAME);
+
     device = PplOpenDevice();
     if (device == INVALID_HANDLE_VALUE) {
         return 1;
