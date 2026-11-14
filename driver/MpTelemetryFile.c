@@ -144,6 +144,7 @@ MpTelemetryPostCreateEmit(
 {
     ULONG options;
     ULONG attributes;
+    ULONG disposition;
 
     if (InterlockedCompareExchange(&g_Telemetry.Active, 0, 0) == 0 ||
         g_Telemetry.ClientPort == NULL) {
@@ -155,12 +156,17 @@ MpTelemetryPostCreateEmit(
     if ((options & FILE_DIRECTORY_FILE) != 0) {
         return;
     }
+    disposition = (options >> 24) & 0xFFu;
 
     /* Options carries the FILE_* disposition in the high byte; the consumer
      * uses it to tell a plain read open from a create/overwrite.  Omitting it
-     * makes every open look like SUPERSEDE and turns each close into a scan. */
+     * makes every open look like SUPERSEDE and turns each close into a scan.
+     *
+     * Only a create/overwrite carries the metadata snapshot: a read open is
+     * the most common operation on a volume and its metadata is not used. */
     MpTelemetryEmitCurrentFileEx(Data, MP_TELEMETRY_EVENT_FILE_CREATE,
-                                 CreateFlags, 0, options, attributes);
+                                 CreateFlags, 0, options, attributes,
+                                 disposition != MP_TELEMETRY_DISPOSITION_OPEN);
 }
 
 static
@@ -300,7 +306,7 @@ MpTelemetryPreWrite(
     }
 
     MpTelemetryEmitCurrentFile(Data, MP_TELEMETRY_EVENT_FILE_WRITE, 0,
-                               length);
+                               length, FALSE);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -314,7 +320,8 @@ MpTelemetryPreCleanup(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    MpTelemetryEmitCurrentFile(Data, MP_TELEMETRY_EVENT_FILE_CLOSE, 0, 0);
+    MpTelemetryEmitCurrentFile(Data, MP_TELEMETRY_EVENT_FILE_CLOSE, 0, 0,
+                               FALSE);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -395,13 +402,14 @@ MpTelemetryPreSetInformation(
                 oldInfo->Name.Buffer,
                 oldInfo->Name.Length / sizeof(WCHAR),
                 newInfo->Name.Buffer,
-                newInfo->Name.Length / sizeof(WCHAR));
+                newInfo->Name.Length / sizeof(WCHAR),
+                NULL);
         } else {
             /* Destination name unavailable: still report the change so the
              * consumer can invalidate its dirty-path cache. */
             MpTelemetryEmitCurrentFile(Data,
                                        MP_TELEMETRY_EVENT_FILE_SET_INFO,
-                                       0, 0);
+                                       0, 0, FALSE);
         }
 
         if (oldInfo != NULL) {
@@ -415,7 +423,7 @@ MpTelemetryPreSetInformation(
             ((PFILE_DISPOSITION_INFORMATION)infoBuffer)->DeleteFile) {
             MpTelemetryEmitCurrentFile(Data,
                                        MP_TELEMETRY_EVENT_FILE_DELETE,
-                                       0, 0);
+                                       0, 0, TRUE);
         }
     } else if (infoClass == FileDispositionInformationEx) {
         if (infoLength >= sizeof(FILE_DISPOSITION_INFORMATION_EX) &&
@@ -423,13 +431,13 @@ MpTelemetryPreSetInformation(
              FILE_DISPOSITION_DELETE) != 0) {
             MpTelemetryEmitCurrentFile(Data,
                                        MP_TELEMETRY_EVENT_FILE_DELETE,
-                                       0, 0);
+                                       0, 0, TRUE);
         }
     } else if (infoClass == FileEndOfFileInformation ||
                infoClass == FileAllocationInformation ||
                infoClass == FileValidDataLengthInformation) {
         MpTelemetryEmitCurrentFile(Data, MP_TELEMETRY_EVENT_FILE_SET_INFO,
-                                   0, 0);
+                                   0, 0, FALSE);
     }
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -446,6 +454,6 @@ MpTelemetryPreSetSecurity(
     UNREFERENCED_PARAMETER(CompletionContext);
 
     MpTelemetryEmitCurrentFile(Data, MP_TELEMETRY_EVENT_FILE_SET_SECURITY,
-                               0, 0);
+                               0, 0, FALSE);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }

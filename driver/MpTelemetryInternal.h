@@ -57,7 +57,29 @@ extern MP_TELEMETRY_STATE g_Telemetry;
 /* Registration table lives with the minifilter callbacks. */
 const FLT_REGISTRATION *MpTelemetryFilterRegistration(VOID);
 
-/* Shared event builder (MpTelemetry.c). */
+/* File metadata sampled inside an operation callback while the file still
+ * exists.  The driver copies the fields selected by Flags into the wire event;
+ * fields whose flag is clear stay zero. */
+typedef struct _MP_TELEMETRY_META {
+    ULONG  Flags;           /* MP_TELEMETRY_META_*                      */
+    ULONG  Attributes;      /* FILE_ATTRIBUTE_*                         */
+    UINT64 FileId;          /* NTFS file reference                      */
+    UINT64 FileSize;        /* end-of-file in bytes                     */
+    UINT64 CreationTime;    /* FILETIME                                 */
+    UINT64 AccessTime;      /* FILETIME                                 */
+    UINT64 WriteTime;       /* FILETIME                                 */
+    UINT64 ChangeTime;      /* FILETIME                                 */
+} MP_TELEMETRY_META;
+
+/* Snapshot the target file of `Data`.  Returns an all-zero block (Flags 0)
+ * when the query is not safe here or fails: FltQueryInformationFile needs
+ * PASSIVE_LEVEL, special APCs enabled and a NULL top-level IRP. */
+VOID
+MpTelemetryQueryFileMeta(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ MP_TELEMETRY_META *Meta);
+
+/* Shared event builder (MpTelemetry.c).  `Meta` may be NULL. */
 NTSTATUS
 MpTelemetrySendEvent(
     _In_ ULONG ProcessId,
@@ -71,7 +93,8 @@ MpTelemetrySendEvent(
     _In_reads_opt_(NameChars) const WCHAR *Name,
     _In_ ULONG NameChars,
     _In_reads_opt_(TargetChars) const WCHAR *Target,
-    _In_ ULONG TargetChars);
+    _In_ ULONG TargetChars,
+    _In_opt_ const MP_TELEMETRY_META *Meta);
 
 /* Requestor filtering and the single-name file event helper. */
 ULONG MpTelemetryRequestorPid(_In_ PFLT_CALLBACK_DATA Data);
@@ -89,14 +112,16 @@ MpTelemetryEmitCurrentFileEx(
     _In_ ULONG Flags,
     _In_ ULONG Extra,
     _In_ ULONG CreateOptions,
-    _In_ ULONG FileAttributes);
+    _In_ ULONG FileAttributes,
+    _In_ BOOLEAN WithMetadata);
 
 VOID
 MpTelemetryEmitCurrentFile(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ ULONG EventId,
     _In_ ULONG Flags,
-    _In_ ULONG Extra);
+    _In_ ULONG Extra,
+    _In_ BOOLEAN WithMetadata);
 
 #ifdef __cplusplus
 }

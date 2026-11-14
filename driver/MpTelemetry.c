@@ -154,7 +154,8 @@ MpTelemetrySendEvent(
     _In_reads_opt_(NameChars) const WCHAR *Name,
     _In_ ULONG NameChars,
     _In_reads_opt_(TargetChars) const WCHAR *Target,
-    _In_ ULONG TargetChars)
+    _In_ ULONG TargetChars,
+    _In_opt_ const MP_TELEMETRY_META *Meta)
 {
     UINT8 buffer[MP_TELEMETRY_MESSAGE_MAX];
     MP_TELEMETRY_EVENT *message = (MP_TELEMETRY_EVENT *)buffer;
@@ -202,7 +203,20 @@ MpTelemetrySendEvent(
     message->ParentProcessId = ParentProcessId;
     message->SubEvent        = Extra;
     message->CreateTime      = CreateTime;
-    message->FileId          = 0;
+    if (Meta != NULL && Meta->Flags != 0) {
+        message->MetadataFlags = Meta->Flags;
+        message->FileId        = Meta->FileId;
+        message->FileSize      = Meta->FileSize;
+        message->CreationTime  = Meta->CreationTime;
+        message->AccessTime    = Meta->AccessTime;
+        message->WriteTime     = Meta->WriteTime;
+        message->ChangeTime    = Meta->ChangeTime;
+        /* The caller's attributes are the requested ones on a create; the
+         * snapshot is the file's actual value. */
+        if ((Meta->Flags & MP_TELEMETRY_META_ATTRIBUTES) != 0) {
+            message->FileAttributes = Meta->Attributes;
+        }
+    }
 
     cursor = message->Data;
     if (NameChars != 0) {
@@ -276,17 +290,80 @@ MpTelemetryProcessCreateTime(
 }
 
 VOID
+MpTelemetryQueryFileMeta(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ MP_TELEMETRY_META *Meta)
+{
+    PFLT_INSTANCE instance;
+    PFILE_OBJECT fileObject;
+    FILE_BASIC_INFORMATION basic;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_INTERNAL_INFORMATION internal;
+
+    RtlZeroMemory(Meta, sizeof(*Meta));
+
+    /* FltQueryInformationFile issues synchronous I/O, so it needs
+     * PASSIVE_LEVEL with special APCs enabled, and it must not run with a
+     * non-NULL top-level IRP (that can deadlock against the file system's own
+     * locks, notably on network file systems).  When the snapshot cannot be
+     * taken, the consumer falls back to its user-mode query. */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return;
+    }
+    if (KeAreAllApcsDisabled()) {
+        return;
+    }
+    if (IoGetTopLevelIrp() != NULL) {
+        return;
+    }
+
+    instance = Data->Iopb->TargetInstance;
+    fileObject = Data->Iopb->TargetFileObject;
+    if (instance == NULL || fileObject == NULL) {
+        return;
+    }
+
+    if (NT_SUCCESS(FltQueryInformationFile(instance, fileObject, &basic,
+                                           sizeof(basic), FileBasicInformation,
+                                           NULL))) {
+        Meta->Attributes   = basic.FileAttributes;
+        Meta->CreationTime = (UINT64)basic.CreationTime.QuadPart;
+        Meta->AccessTime   = (UINT64)basic.LastAccessTime.QuadPart;
+        Meta->WriteTime    = (UINT64)basic.LastWriteTime.QuadPart;
+        Meta->ChangeTime   = (UINT64)basic.ChangeTime.QuadPart;
+        Meta->Flags       |= MP_TELEMETRY_META_TIMES |
+                             MP_TELEMETRY_META_ATTRIBUTES;
+    }
+    if (NT_SUCCESS(FltQueryInformationFile(instance, fileObject, &standard,
+                                           sizeof(standard),
+                                           FileStandardInformation, NULL))) {
+        Meta->FileSize = (UINT64)standard.EndOfFile.QuadPart;
+        Meta->Flags   |= MP_TELEMETRY_META_SIZE;
+    }
+    if (NT_SUCCESS(FltQueryInformationFile(instance, fileObject, &internal,
+                                           sizeof(internal),
+                                           FileInternalInformation, NULL))) {
+        Meta->FileId = (UINT64)internal.IndexNumber.QuadPart;
+        Meta->Flags |= MP_TELEMETRY_META_FILE_ID;
+    }
+}
+
+VOID
 MpTelemetryEmitCurrentFileEx(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ ULONG EventId,
     _In_ ULONG Flags,
     _In_ ULONG Extra,
     _In_ ULONG CreateOptions,
-    _In_ ULONG FileAttributes)
+    _In_ ULONG FileAttributes,
+    _In_ BOOLEAN WithMetadata)
 {
     PFLT_FILE_NAME_INFORMATION info = NULL;
+    MP_TELEMETRY_META meta;
     NTSTATUS status;
     ULONG pid;
+
+    RtlZeroMemory(&meta, sizeof(meta));
 
     if (InterlockedCompareExchange(&g_Telemetry.Active, 0, 0) == 0) {
         return;
@@ -310,11 +387,16 @@ MpTelemetryEmitCurrentFileEx(
         return;
     }
 
+    if (WithMetadata) {
+        MpTelemetryQueryFileMeta(Data, &meta);
+    }
+
     (void)MpTelemetrySendEvent(pid, EventId, Flags, 0, CreateOptions,
                                FileAttributes, Extra,
                                MpTelemetryProcessCreateTime(pid),
                                info->Name.Buffer,
-                               info->Name.Length / sizeof(WCHAR), NULL, 0);
+                               info->Name.Length / sizeof(WCHAR), NULL, 0,
+                               &meta);
     FltReleaseFileNameInformation(info);
 }
 
@@ -323,9 +405,11 @@ MpTelemetryEmitCurrentFile(
     _In_ PFLT_CALLBACK_DATA Data,
     _In_ ULONG EventId,
     _In_ ULONG Flags,
-    _In_ ULONG Extra)
+    _In_ ULONG Extra,
+    _In_ BOOLEAN WithMetadata)
 {
-    MpTelemetryEmitCurrentFileEx(Data, EventId, Flags, Extra, 0, 0);
+    MpTelemetryEmitCurrentFileEx(Data, EventId, Flags, Extra, 0, 0,
+                                 WithMetadata);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -357,7 +441,7 @@ MpTelemetryProcessNotify(
 
     if (CreateInfo == NULL) {
         (void)MpTelemetrySendEvent(pid, MP_TELEMETRY_EVENT_PROCESS_EXIT, 0,
-                                   0, 0, 0, 0, 0, NULL, 0, NULL, 0);
+                                   0, 0, 0, 0, 0, NULL, 0, NULL, 0, NULL);
         return;
     }
 
@@ -374,7 +458,7 @@ MpTelemetryProcessNotify(
     createTime = (UINT64)PsGetProcessCreateTimeQuadPart(Process);
     (void)MpTelemetrySendEvent(pid, MP_TELEMETRY_EVENT_PROCESS_CREATE, 0,
                                parentPid, 0, 0, 0, createTime,
-                               name, nameChars, NULL, 0);
+                               name, nameChars, NULL, 0, NULL);
 }
 
 /* ------------------------------------------------------------------------- */
