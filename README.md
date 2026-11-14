@@ -134,6 +134,25 @@ ETW, start the listener and then inject the Detours payload:
 For name filters, the on-connect broker, other signers, and all CLI options, see the
 [command reference and examples](GUIDE.md#quick-start).
 
+For signals with a capture rule (`0x4039`, `0x4051`, `0x4095`) the hook copies
+the request targets behind `Data` (file path, process image/command line,
+registry names, network endpoint, ETW properties).  It only copies bytes; the
+`CaptureHex` field is written through to the JSONL `capture_hex` sidecar and
+decoded by the mpclient comparator
+(`tools/rsignal-lab/rsignal_payload.py`, driven by
+`rsignal_capture_spec.json`).
+
+The injected DLL is mapped in `MsMpEng.exe` and cannot be replaced in place.
+Build the new copy to another output directory and inject that path (or restart
+the service first):
+
+```powershell
+msbuild MakeMePPL.sln /t:MpEngineHook /p:Configuration=Release /p:Platform=x64 `
+    /p:OutDir=C:\Repos\DefenderReversingHelper\bin\Release2\
+.\bin\Release\injector.exe MsMpEng.exe .\bin\Release2\mpengine_hook.dll `
+    --ppl --allow-dynamic-code --fix-handle --kernel-thread --restore
+```
+
 ## Kernel telemetry source (WdFilter-style)
 
 `MakeMePPL.sys` is also a minifilter. It mirrors the shape of `WdFilter.sys`:

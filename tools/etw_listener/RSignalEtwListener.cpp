@@ -513,6 +513,20 @@ HandleCallEvent(
                            contextHex.c_str());
         }
 
+        /*
+         * The request capture is already ASCII hex in the ETW field; pass it
+         * through unchanged so both channels expose the same `capture_hex`
+         * sidecar field.  Decoding happens in tools/rsignal-lab.
+         */
+        {
+            std::string captureHex;
+
+            if (Parser.try_parse(L"CaptureHex", captureHex) &&
+                !captureHex.empty()) {
+                line += Format(",\"capture_hex\":\"%s\"", captureHex.c_str());
+            }
+        }
+
         line += "}\n";
         PrintJson(line);
         return;
