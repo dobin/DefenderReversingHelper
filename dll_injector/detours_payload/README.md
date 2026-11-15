@@ -51,6 +51,9 @@ block or modify anything. For each call it emits:
 5. `EngineTrace` — the structured records handed to the same callback:
    deferred scan requests (`kind 0x28`, decoded) and engine telemetry kinds
    with a bounded payload hex copy (see below).
+6. `EngineMem` — the engine's own `OpenProcess`, `VirtualQueryEx` and
+   `NtReadVirtualMemoryEx` calls while it scans another process, captured by
+   in-engine IAT/pointer observers (see "Memory-scan observers").
 
 Event field names and types are listed in `shared/MpEngineEtw.h`. Because the
 `Status`/`RSignalCall` events are ordinary `TraceLoggingWrite` calls, they can
@@ -139,6 +142,62 @@ Caveats:
   hook copies them before forwarding.
 - If the engine reboots (`RSIG_UNLOADENGINE`, 0x400a) the watchdog re-takes
   the slot.
+
+## Memory-scan observers
+
+The engine's process-memory scan path calls three host entry points. The
+payload redirects all three inside `mpengine.dll`, forwards the call unchanged,
+and emits an `EngineMem` event:
+
+| Event `Op` | Target | Mechanism |
+|---|---|---|
+| `open` | `KERNEL32!OpenProcess` | IAT entry in `mpengine.dll` |
+| `query` | `KERNEL32!VirtualQueryEx` | IAT entry in `mpengine.dll` |
+| `read` | `ntdll!NtReadVirtualMemoryEx` (or `NtReadVirtualMemory`) | the engine's own resolved pointer at `mpengine + 0x1103038` |
+
+The IAT patch is scoped to `mpengine.dll`; it is not a process-wide ntdll hook.
+The read pointer is validated before it is written (committed, writable data
+page; current value `NULL`, a ntdll address, or the observer itself), so a
+different engine build is reported instead of corrupting an unrelated global.
+
+Sample listener output:
+
+```text
+engine scan open  : pid=8172 access=0x410 status=0x00000000
+engine scan query : target_pid=8172 handle=0x3B4 base=0x3D076F7000 size=0x9000 status=0x00000030 state=0x1000 protect=0x04
+engine scan read  : target_pid=8172 handle=0x3B4 base=0x3D076F7000 size=0x9000 status=0x00000000 read=0x9000
+```
+
+`Status` is the Win32 error for `open`, the `VirtualQueryEx` result for
+`query`, and the NTSTATUS for `read`; `State`/`Protect` are the
+`MEMORY_BASIC_INFORMATION` fields and `read` is the actual transferred byte
+count. In `jsonl` these are `{"k":"mem","op":"read","target_pid":..., ...}`
+objects; use `--quiet-mem` in the listener to hide them.
+
+The observers are installed by `HookMaintenanceThread`, not by the Detours
+transaction, so they do not require code patches or ACG to be cleared. Because
+MpSvc can unload and reload `mpengine.dll` at any time, the maintenance thread
+re-finds both IAT slots and re-fills the read pointer whenever the module base
+or the engine's own pointer changes. A successful install/re-arm emits:
+
+```text
+memory observers installed: OpenProcess, VirtualQueryEx, NtReadVirtualMemoryEx (module=0x...)
+```
+
+and a build whose layout no longer matches emits a `Status` error naming the
+missing observer instead of failing silently.
+
+Caveats:
+
+- Only calls that go through `mpengine.dll`'s kernel32 imports and its cached
+  ntdll pointer are observed. A direct syscall or a different resolution path
+  is not.
+- The read-pointer RVA is engine-build specific (`mpengine 1.1.26100.4`).
+  Re-check it after a Defender platform update; the safety check above turns a
+  mismatch into a status message.
+- A memory scan can issue hundreds of reads per second, so `EngineMem` is the
+  highest-volume event. ETW drops (never blocks) if the listener cannot keep
+  up. Use `--quiet-mem` when only `RSignalCall`/`EngineTrace` are wanted.
 
 ## Surviving engine reloads
 

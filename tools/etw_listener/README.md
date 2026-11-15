@@ -28,6 +28,7 @@ Options:
 | `--quiet-status` | Hide `Status` (install/diagnostic) events |
 | `--quiet-engine-log` | Hide `EngineLog` (engine's own log lines) events |
 | `--quiet-trace` | Hide `EngineTrace` (structured engine records) |
+| `--quiet-mem` | Hide `EngineMem` (`OpenProcess`/`VirtualQueryEx`/`NtReadVirtualMemoryEx`) |
 | `--help` | Usage |
 
 By default each call is one line:
@@ -100,6 +101,21 @@ hide these records. In `jsonl` format they are
 
 See [`docs/engine_trace_kinds.md`](../../docs/engine_trace_kinds.md) for the
 recovered record layouts and the per-kind meaning.
+
+`EngineMem` shows the engine's process-memory scan path as the engine calls it:
+
+```text
+... engine scan open  : pid=8172 access=0x410 status=0x00000000
+... engine scan query : target_pid=8172 handle=0x3B4 base=0x3D076F7000 size=0x9000 status=0x00000030 state=0x1000 protect=0x04
+... engine scan read  : target_pid=8172 handle=0x3B4 base=0x3D076F7000 size=0x9000 status=0x00000000 read=0x9000
+```
+
+`open` is `OpenProcess` (with the requested access), `query` is
+`VirtualQueryEx` (with the returned region state/protection) and `read` is
+`NtReadVirtualMemoryEx` (with the transferred byte count). These come from
+observers installed inside `mpengine.dll`; they are not ETW events Defender
+emits itself. Use `--quiet-mem` to hide them; in `jsonl` format they are
+`{"k":"mem","op":"read","target_pid":..., ...}` objects.
 
 Engine log lines are event-driven: the engine only emits them on boot (ASR rule
 load), on a detection, or when its diagnostics are requested. To force a burst

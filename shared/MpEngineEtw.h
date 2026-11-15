@@ -28,6 +28,7 @@
 #define MPENGINE_ETW_EVENT_STATUS     "Status"
 #define MPENGINE_ETW_EVENT_ENGINE_LOG "EngineLog"
 #define MPENGINE_ETW_EVENT_TRACE      "EngineTrace"
+#define MPENGINE_ETW_EVENT_MEM        "EngineMem"
 
 /* Value of the first field ("Type") of every event. */
 #define MPENGINE_ETW_TYPE_CALL       1u
@@ -35,6 +36,7 @@
 #define MPENGINE_ETW_TYPE_STATUS     3u
 #define MPENGINE_ETW_TYPE_ENGINE_LOG 4u
 #define MPENGINE_ETW_TYPE_TRACE      5u
+#define MPENGINE_ETW_TYPE_MEM        6u
 
 /*
  * Field names, for reference:
@@ -56,6 +58,11 @@
  *                 Version(UInt32) Id(UInt32) KindName(String) Target(String)
  *                 Detail(String) PayloadLength(UInt32) PayloadHex(String)
  *
+ *   EngineMem     Type(UInt32) SeqNum(UInt32) Op(String) Pid(UInt32)
+ *                 Handle(UInt64) Base(UInt64) Size(UInt64) Access(UInt64)
+ *                 Status(UInt32) Transferred(UInt64) State(UInt32)
+ *                 Protect(UInt32)
+ *
  * EngineLog carries the engine's own diagnostic lines (module "Engine",
  * "Engine-HIPS", ...) captured from the trace callback in the engine instance,
  * not from the WPP/TraceMessage path.  Kind is the engine record kind
@@ -75,6 +82,16 @@
  * in docs/engine_trace_kinds.md.  Kinds without a decoder keep the structured
  * fields zero and PayloadHex is a bounded hex copy of the payload for offline
  * decoding.  PayloadHex is uppercase hex text, like ContextHex/DataHex.
+ *
+ * EngineMem carries the engine's process-memory scan path as seen through the
+ * host APIs it calls: Op is "open" (OpenProcess), "query" (VirtualQueryEx) or
+ * "read" (NtReadVirtualMemoryEx).  Pid is the target process, Handle the
+ * process handle, Base/Size the address range, Access the OpenProcess desired
+ * access, Status the Win32 error / VirtualQueryEx result / NTSTATUS, and
+ * Transferred the bytes actually read.  State/Protect are the
+ * MEMORY_BASIC_INFORMATION fields for a query.  The payload installs these
+ * observers on the live mpengine module and re-installs them after an engine
+ * reload.
  *
  * ContextHex/DataHex are uppercase hex text (two characters per captured
  * byte). Hex travels as a plain string so any consumer decodes the same bytes

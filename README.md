@@ -17,7 +17,9 @@ It also ships `bin\Release\mpengine_hook.dll`, a Microsoft Detours payload that
 hooks `mpengine.dll!__rsignal` and emits each call's arguments and pointed-to
 data as ETW/TraceLogging events. The same payload captures the engine's own
 `Engine:`/`Engine-HIPS:` log lines and its structured trace records (deferred
-scan requests and telemetry) through the engine-instance trace callback.
+scan requests and telemetry) through the engine-instance trace callback, and
+observes the engine's `OpenProcess`/`VirtualQueryEx`/`NtReadVirtualMemoryEx`
+memory-scan calls (re-armed after an engine reload).
 `bin\Release\rsignal_etw_listener.exe` (third_party/krabsetw) renders them in
 another process. Detours is compiled from its source checkout
 (`C:\Repos\Detours` by default). Use `--allow-dynamic-code` in addition to

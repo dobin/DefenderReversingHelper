@@ -60,6 +60,7 @@ struct Options {
     bool           showStatus = true;
     bool           showEngineLog = true;
     bool           showEngineTrace = true;
+    bool           showEngineMem = true;
 };
 
 Options                g_options;
@@ -717,6 +718,113 @@ HandleEngineTraceEvent(
     Print(text);
 }
 
+/*
+ * EngineMem is produced by the payload's process-memory observers.  The engine
+ * calls OpenProcess / VirtualQueryEx through its kernel32 IAT and
+ * NtReadVirtualMemoryEx through its own resolved pointer; Op says which one,
+ * and the remaining fields mirror what the engine passed and what the OS
+ * returned.
+ */
+void
+HandleEngineMemEvent(
+    _In_ krabs::parser& Parser,
+    _In_ const EVENT_RECORD& Record,
+    _In_ const std::string& Prefix)
+{
+    uint32_t    sequence = 0;
+    uint32_t    targetPid = 0;
+    uint32_t    status = 0;
+    uint32_t    state = 0;
+    uint32_t    protect = 0;
+    uint64_t    handle = 0;
+    uint64_t    base = 0;
+    uint64_t    size = 0;
+    uint64_t    access = 0;
+    uint64_t    transferred = 0;
+    std::string op;
+
+    if (!g_options.showEngineMem) {
+        return;
+    }
+
+    Parser.try_parse(L"SeqNum", sequence);
+    Parser.try_parse(L"Pid", targetPid);
+    Parser.try_parse(L"Handle", handle);
+    Parser.try_parse(L"Base", base);
+    Parser.try_parse(L"Size", size);
+    Parser.try_parse(L"Access", access);
+    Parser.try_parse(L"Status", status);
+    Parser.try_parse(L"Transferred", transferred);
+    Parser.try_parse(L"State", state);
+    Parser.try_parse(L"Protect", protect);
+    (void)Parser.try_parse(L"Op", op);
+
+    if (g_options.jsonlFormat) {
+        PrintJson(Format("{\"k\":\"mem\",\"seq\":%lu,\"ts\":%llu,"
+                         "\"pid\":%lu,\"tid\":%lu,\"op\":\"%s\","
+                         "\"target_pid\":%lu,\"handle\":%llu,\"base\":%llu,"
+                         "\"size\":%llu,\"access\":%llu,\"status\":%lu,"
+                         "\"transferred\":%llu,\"state\":%lu,"
+                         "\"protect\":%lu}\n",
+                         (unsigned long)sequence,
+                         (unsigned long long)WallClockTimestamp(Record),
+                         (unsigned long)Record.EventHeader.ProcessId,
+                         (unsigned long)Record.EventHeader.ThreadId,
+                         JsonEscape(op).c_str(),
+                         (unsigned long)targetPid,
+                         (unsigned long long)handle,
+                         (unsigned long long)base,
+                         (unsigned long long)size,
+                         (unsigned long long)access,
+                         (unsigned long)status,
+                         (unsigned long long)transferred,
+                         (unsigned long)state,
+                         (unsigned long)protect));
+        return;
+    }
+
+    if (op == "open") {
+        Print(Format("%s engine scan open : pid=%lu access=0x%llX "
+                     "status=0x%08lX\n",
+                     Prefix.c_str(),
+                     (unsigned long)targetPid,
+                     (unsigned long long)access,
+                     (unsigned long)status));
+    } else if (op == "query") {
+        Print(Format("%s engine scan query : target_pid=%lu handle=0x%llX "
+                     "base=0x%llX size=0x%llX status=0x%08lX state=0x%lX "
+                     "protect=0x%lX\n",
+                     Prefix.c_str(),
+                     (unsigned long)targetPid,
+                     (unsigned long long)handle,
+                     (unsigned long long)base,
+                     (unsigned long long)size,
+                     (unsigned long)status,
+                     (unsigned long)state,
+                     (unsigned long)protect));
+    } else if (op == "read") {
+        Print(Format("%s engine scan read : target_pid=%lu handle=0x%llX "
+                     "base=0x%llX size=0x%llX status=0x%08lX read=0x%llX\n",
+                     Prefix.c_str(),
+                     (unsigned long)targetPid,
+                     (unsigned long long)handle,
+                     (unsigned long long)base,
+                     (unsigned long long)size,
+                     (unsigned long)status,
+                     (unsigned long long)transferred));
+    } else {
+        Print(Format("%s engine scan mem : op=%s target_pid=%lu "
+                     "handle=0x%llX base=0x%llX size=0x%llX status=0x%08lX\n",
+                     Prefix.c_str(),
+                     op.empty() ? "?" : op.c_str(),
+                     (unsigned long)targetPid,
+                     (unsigned long long)handle,
+                     (unsigned long long)base,
+                     (unsigned long long)size,
+                     (unsigned long)status));
+    }
+}
+
 void
 HandleCallEvent(
     _In_ krabs::parser& Parser,
@@ -933,6 +1041,9 @@ OnEvent(
         case MPENGINE_ETW_TYPE_TRACE:
             HandleEngineTraceEvent(parser, Record, prefix);
             break;
+        case MPENGINE_ETW_TYPE_MEM:
+            HandleEngineMemEvent(parser, Record, prefix);
+            break;
         default:
             Print(Format("%s event=%s (unknown type %lu)\n",
                          prefix.c_str(),
@@ -982,6 +1093,8 @@ Usage(void)
         "  --quiet-status     hide Status (install/diagnostic) events\n"
         "  --quiet-engine-log hide EngineLog (engine's own log lines) events\n"
         "  --quiet-trace      hide EngineTrace (structured engine records)\n"
+        "  --quiet-mem        hide EngineMem (engine OpenProcess/VirtualQueryEx/\n"
+        "                     NtReadVirtualMemoryEx) events\n"
         "  --help             show this text\n"
         "\n"
         "Run elevated (or as a member of Performance Log Users). Start the\n"
@@ -1093,6 +1206,8 @@ ParseOptions(
             g_options.showEngineLog = false;
         } else if (argument == L"--quiet-trace") {
             g_options.showEngineTrace = false;
+        } else if (argument == L"--quiet-mem") {
+            g_options.showEngineMem = false;
         } else {
             fprintf(stderr, "unknown argument: %ls\n", argument.c_str());
             Usage();

@@ -63,6 +63,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #include <intrin.h>
 #include <evntrace.h>
 #include <TraceLoggingProvider.h>
@@ -1043,6 +1044,16 @@ EmitReturn(
 #define RSI_ENGINE_TRACE_ABI_RVA    0x10D0738u
 #define RSI_ENGINE_TRACE_FN_LEGACY  0x0B00u
 #define RSI_ENGINE_TRACE_FN_NEW     0x0B08u
+
+/*
+ * The engine resolves NtReadVirtualMemoryEx once into this module global and
+ * calls through the pointer (mpengine 1.1.26100.4; re-check per engine build).
+ * It only fills the slot while it is NULL, so the observer has to be in place
+ * before the first read.
+ */
+#ifndef RSI_ENGINE_NTREAD_RVA
+#define RSI_ENGINE_NTREAD_RVA       0x1103038u
+#endif
 
 #define RSI_ENGINE_RECORD_TIME      0x08u
 #define RSI_ENGINE_RECORD_PAYLOAD   0x10u
@@ -2152,6 +2163,549 @@ ArmEngineLog(
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* Process-memory scan observers                                             */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The engine reads other processes through three host entry points:
+ *
+ *   OpenProcess            kernel32 import   (image resolution, EMS open)
+ *   VirtualQueryEx         kernel32 import   (memory layout enumeration)
+ *   NtReadVirtualMemoryEx  resolved lazily into mpengine+RSI_ENGINE_NTREAD_RVA
+ *
+ * This is the in-engine counterpart of mpclient's mpengine_observe.c.  It
+ * patches the two IAT entries in mpengine.dll (scoped to the engine, not a
+ * process-wide ntdll hook) and the engine's own read-function global, forwards
+ * every call unchanged, and emits an EngineMem event with the same arguments
+ * the engine passed.
+ *
+ * The engine module is unloaded and reloaded by MpSvc, so nothing here is
+ * cached across a reload: the maintenance thread re-finds the IAT slots and
+ * re-writes the read global whenever the module base changes or the engine
+ * rewrites its own pointer.  The read-slot address is validated (committed,
+ * writable data page; current value NULL, ntdll, or our wrapper) before it is
+ * written, so a future engine build with a different RVA is reported instead
+ * of corrupting unrelated engine state.
+ */
+
+typedef HANDLE (WINAPI *RSI_OPEN_PROCESS_FN)(DWORD, BOOL, DWORD);
+typedef SIZE_T (WINAPI *RSI_VIRTUAL_QUERY_EX_FN)(HANDLE, LPCVOID,
+                                                 PMEMORY_BASIC_INFORMATION,
+                                                 SIZE_T);
+typedef LONG (NTAPI *RSI_NT_READ_VM_FN)(HANDLE, PVOID, PVOID, SIZE_T,
+                                        PSIZE_T, ULONG);
+
+#define RSI_MEM_OPEN   0x1u
+#define RSI_MEM_QUERY  0x2u
+#define RSI_MEM_READ   0x4u
+#define RSI_MEM_ALL    (RSI_MEM_OPEN | RSI_MEM_QUERY | RSI_MEM_READ)
+
+#ifndef RSI_MEM_IAT_ENTRIES
+#define RSI_MEM_IAT_ENTRIES 8192
+#endif
+#ifndef RSI_MEM_IAT_NAME_CHARS
+#define RSI_MEM_IAT_NAME_CHARS 96
+#endif
+
+static RSI_OPEN_PROCESS_FN     g_RealOpenProcess = NULL;
+static RSI_VIRTUAL_QUERY_EX_FN g_RealVirtualQueryEx = NULL;
+static RSI_NT_READ_VM_FN       g_RealNtReadVirtualMemory = NULL;
+
+static void** g_OpenProcessSlot = NULL;
+static void** g_VirtualQuerySlot = NULL;
+static void** g_NtReadSlot = NULL;
+static PVOID  g_MemObserveModule = NULL;
+static DWORD  g_MemObserveTimeDateStamp = 0;
+static DWORD  g_MemObserveSizeOfImage = 0;
+static LONG   g_MemObserveMask = -1;
+static LONG   g_MemObserveCalls = 0;
+static volatile LONG g_MemObserveActive = 0;
+
+static HANDLE WINAPI Hook_OpenProcess(DWORD Access, BOOL Inherit, DWORD Pid);
+static SIZE_T WINAPI Hook_VirtualQueryEx(HANDLE Process, LPCVOID Address,
+                                         PMEMORY_BASIC_INFORMATION Info,
+                                         SIZE_T Length);
+static LONG NTAPI Hook_NtReadVirtualMemory(HANDLE Process, PVOID Address,
+                                           PVOID Buffer, SIZE_T Size,
+                                           PSIZE_T Read, ULONG Flags);
+
+/*
+ * A reload usually changes the base, but the loader can also map the new image
+ * at the old base.  The PE timestamp/size pair distinguishes the two images, so
+ * a cached IAT slot is never reused for a different engine build.
+ */
+static BOOL
+ReadModuleIdentity(
+    _In_ HMODULE Module,
+    _Out_ DWORD* TimeDateStamp,
+    _Out_ DWORD* SizeOfImage)
+{
+    const BYTE* base = (const BYTE*)Module;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS nt;
+
+    if (TimeDateStamp == NULL || SizeOfImage == NULL) {
+        return FALSE;
+    }
+    *TimeDateStamp = 0;
+    *SizeOfImage = 0;
+    if (base == NULL) {
+        return FALSE;
+    }
+    if (CopyTargetMemory(base, &dos, sizeof(dos)) != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000) {
+        return FALSE;
+    }
+    if (CopyTargetMemory(base + dos.e_lfanew, &nt, sizeof(nt)) != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE) {
+        return FALSE;
+    }
+
+    *TimeDateStamp = nt.FileHeader.TimeDateStamp;
+    *SizeOfImage = nt.OptionalHeader.SizeOfImage;
+    return TRUE;
+}
+
+static BOOL
+CopyTargetString(
+    _In_ const void* Address,
+    _Out_writes_z_(Chars) char* Destination,
+    _In_ SIZE_T Chars)
+{
+    SIZE_T used = 0;
+
+    if (Destination == NULL || Chars == 0) {
+        return FALSE;
+    }
+    Destination[0] = '\0';
+    if (Address == NULL) {
+        return FALSE;
+    }
+
+    while (used < Chars - 1) {
+        SIZE_T read = CopyTargetMemory((const BYTE*)Address + used,
+                                       Destination + used, Chars - 1 - used);
+        SIZE_T i;
+
+        if (read == 0) {
+            break;
+        }
+        for (i = 0; i < read; ++i) {
+            if (Destination[used + i] == '\0') {
+                return TRUE;
+            }
+        }
+        used += read;
+    }
+
+    Destination[used] = '\0';
+    return used != 0;
+}
+
+/*
+ * Find one import address table entry in a loaded module.  The PE structures
+ * are copied through CopyTargetMemory so a module that is being unloaded at
+ * this instant makes the walk stop instead of faulting.
+ */
+static void**
+FindIatSlot(
+    _In_ HMODULE Module,
+    _In_ const char* DllName,
+    _In_ const char* FunctionName)
+{
+    const BYTE* base = (const BYTE*)Module;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS nt;
+    DWORD importRva;
+    DWORD descriptorIndex;
+
+    if (base == NULL || DllName == NULL || FunctionName == NULL) {
+        return NULL;
+    }
+    if (CopyTargetMemory(base, &dos, sizeof(dos)) != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000) {
+        return NULL;
+    }
+    if (CopyTargetMemory(base + dos.e_lfanew, &nt, sizeof(nt)) != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE) {
+        return NULL;
+    }
+
+    importRva = nt.OptionalHeader
+                    .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                    .VirtualAddress;
+    if (importRva == 0) {
+        return NULL;
+    }
+
+    for (descriptorIndex = 0; descriptorIndex < RSI_MEM_IAT_ENTRIES;
+         ++descriptorIndex) {
+        IMAGE_IMPORT_DESCRIPTOR descriptor;
+        char dllName[RSI_MEM_IAT_NAME_CHARS];
+        DWORD lookupRva;
+        DWORD thunkIndex;
+
+        if (CopyTargetMemory(base + importRva +
+                                 descriptorIndex * sizeof(descriptor),
+                             &descriptor, sizeof(descriptor)) !=
+                sizeof(descriptor)) {
+            return NULL;
+        }
+        if (descriptor.Name == 0) {
+            return NULL;
+        }
+        if (!CopyTargetString(base + descriptor.Name, dllName,
+                              sizeof(dllName)) ||
+            _stricmp(dllName, DllName) != 0) {
+            continue;
+        }
+
+        lookupRva = descriptor.OriginalFirstThunk != 0
+                        ? descriptor.OriginalFirstThunk
+                        : descriptor.FirstThunk;
+        for (thunkIndex = 0; thunkIndex < RSI_MEM_IAT_ENTRIES; ++thunkIndex) {
+            IMAGE_THUNK_DATA lookup;
+            IMAGE_THUNK_DATA* iat;
+            char functionName[RSI_MEM_IAT_NAME_CHARS];
+
+            if (CopyTargetMemory(base + lookupRva +
+                                     thunkIndex * sizeof(lookup),
+                                 &lookup, sizeof(lookup)) != sizeof(lookup)) {
+                break;
+            }
+            if (lookup.u1.AddressOfData == 0) {
+                break;
+            }
+            if (IMAGE_SNAP_BY_ORDINAL(lookup.u1.Ordinal)) {
+                continue;
+            }
+            if (!CopyTargetString(base + lookup.u1.AddressOfData +
+                                      sizeof(WORD),
+                                  functionName, sizeof(functionName)) ||
+                strcmp(functionName, FunctionName) != 0) {
+                continue;
+            }
+
+            iat = (IMAGE_THUNK_DATA*)(base + descriptor.FirstThunk);
+            return (void**)&iat[thunkIndex].u1.Function;
+        }
+    }
+
+    return NULL;
+}
+
+static BOOL
+EnsureSlot(
+    _In_ void** Slot,
+    _In_ PVOID Replacement)
+{
+    PVOID current = NULL;
+
+    if (Slot == NULL || !ReadTargetPointer(Slot, &current)) {
+        return FALSE;
+    }
+    if (current == Replacement) {
+        return TRUE;
+    }
+    return WriteTargetPointer(Slot, Replacement);
+}
+
+static ULONG
+TargetProcessId(
+    _In_ HANDLE Process)
+{
+    DWORD pid;
+
+    if (Process == NULL || Process == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    pid = GetProcessId(Process);
+    return (ULONG)pid;
+}
+
+static BOOL
+IsNtdllPointer(
+    _In_ PVOID Address,
+    _In_ HMODULE Ntdll)
+{
+    MEMORY_BASIC_INFORMATION memoryInfo;
+
+    if (Address == NULL) {
+        return TRUE;
+    }
+    if (Ntdll == NULL) {
+        return FALSE;
+    }
+    if (VirtualQuery(Address, &memoryInfo, sizeof(memoryInfo)) == 0) {
+        return FALSE;
+    }
+    return memoryInfo.AllocationBase == (PVOID)Ntdll;
+}
+
+static void
+EmitEngineMem(
+    _In_ const char* Op,
+    _In_ ULONG Pid,
+    _In_ UINT64 Handle,
+    _In_ UINT64 Base,
+    _In_ UINT64 Size,
+    _In_ UINT64 Access,
+    _In_ ULONG Status,
+    _In_ UINT64 Transferred,
+    _In_ ULONG State,
+    _In_ ULONG Protect)
+{
+    if (!g_ProviderRegistered) {
+        return;
+    }
+
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_MEM,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_MEM, "Type"),
+        TraceLoggingUInt32((UINT32)InterlockedIncrement(&g_MemObserveCalls),
+                           "SeqNum"),
+        TraceLoggingString(Op, "Op"),
+        TraceLoggingUInt32(Pid, "Pid"),
+        TraceLoggingUInt64(Handle, "Handle"),
+        TraceLoggingUInt64(Base, "Base"),
+        TraceLoggingUInt64(Size, "Size"),
+        TraceLoggingUInt64(Access, "Access"),
+        TraceLoggingUInt32(Status, "Status"),
+        TraceLoggingUInt64(Transferred, "Transferred"),
+        TraceLoggingUInt32(State, "State"),
+        TraceLoggingUInt32(Protect, "Protect"));
+}
+
+static HANDLE WINAPI
+Hook_OpenProcess(
+    _In_ DWORD Access,
+    _In_ BOOL Inherit,
+    _In_ DWORD Pid)
+{
+    RSI_OPEN_PROCESS_FN real = g_RealOpenProcess;
+    HANDLE handle;
+    DWORD  error;
+    DWORD  savedError;
+
+    if (real == NULL) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return NULL;
+    }
+
+    handle = real(Access, Inherit, Pid);
+    error = (handle != NULL) ? 0 : GetLastError();
+    savedError = GetLastError();
+
+    if (InterlockedCompareExchange(&g_MemObserveActive, 0, 0) != 0 &&
+        TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitEngineMem("open", (ULONG)Pid, (UINT64)(ULONG_PTR)handle, 0, 0,
+                      (UINT64)Access, error, 0, 0, 0);
+    }
+
+    SetLastError(savedError);
+    return handle;
+}
+
+static SIZE_T WINAPI
+Hook_VirtualQueryEx(
+    _In_ HANDLE Process,
+    _In_ LPCVOID Address,
+    _Out_writes_bytes_(Length) PMEMORY_BASIC_INFORMATION Info,
+    _In_ SIZE_T Length)
+{
+    RSI_VIRTUAL_QUERY_EX_FN real = g_RealVirtualQueryEx;
+    SIZE_T result;
+    DWORD  savedError;
+    ULONG  state = 0;
+    ULONG  protect = 0;
+    UINT64 regionSize = 0;
+
+    if (real == NULL) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return 0;
+    }
+
+    result = real(Process, Address, Info, Length);
+    savedError = GetLastError();
+    if (result != 0 && Info != NULL) {
+        state = (ULONG)Info->State;
+        protect = (ULONG)Info->Protect;
+        regionSize = (UINT64)Info->RegionSize;
+    }
+
+    if (InterlockedCompareExchange(&g_MemObserveActive, 0, 0) != 0 &&
+        TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitEngineMem("query", TargetProcessId(Process),
+                      (UINT64)(ULONG_PTR)Process,
+                      (UINT64)(ULONG_PTR)Address, regionSize, 0,
+                      (ULONG)result, (UINT64)result, state, protect);
+    }
+
+    SetLastError(savedError);
+    return result;
+}
+
+static LONG NTAPI
+Hook_NtReadVirtualMemory(
+    _In_ HANDLE Process,
+    _In_ PVOID Address,
+    _Out_writes_bytes_(Size) PVOID Buffer,
+    _In_ SIZE_T Size,
+    _Out_opt_ PSIZE_T Read,
+    _In_ ULONG Flags)
+{
+    RSI_NT_READ_VM_FN real = g_RealNtReadVirtualMemory;
+    LONG   status;
+    DWORD  savedError;
+    SIZE_T transferred = 0;
+
+    if (real == NULL) {
+        return (LONG)0xC0000001L;     /* STATUS_UNSUCCESSFUL */
+    }
+
+    status = real(Process, Address, Buffer, Size, Read, Flags);
+    savedError = GetLastError();
+    if (status >= 0) {
+        transferred = (Read != NULL) ? *Read : Size;
+    }
+
+    if (InterlockedCompareExchange(&g_MemObserveActive, 0, 0) != 0 &&
+        TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitEngineMem("read", TargetProcessId(Process),
+                      (UINT64)(ULONG_PTR)Process,
+                      (UINT64)(ULONG_PTR)Address, (UINT64)Size, 0,
+                      (ULONG)status, (UINT64)transferred, 0, 0);
+    }
+
+    SetLastError(savedError);
+    return status;
+}
+
+static void
+ReportMemoryObserverMask(
+    _In_ HMODULE Module,
+    _In_ LONG Mask)
+{
+    if (Mask == g_MemObserveMask) {
+        return;
+    }
+    g_MemObserveMask = Mask;
+    InterlockedExchange(&g_MemObserveActive, (Mask != 0) ? 1 : 0);
+
+    if (Mask == RSI_MEM_ALL) {
+        EmitStatusInfoV(0, "memory observers installed: OpenProcess, "
+                        "VirtualQueryEx, NtReadVirtualMemoryEx (module=0x%p)",
+                        (void*)Module);
+        return;
+    }
+
+    EmitStatusErrorV(0, "memory observers incomplete: OpenProcess=%s "
+                     "VirtualQueryEx=%s NtReadVirtualMemoryEx=%s (module=0x%p)",
+                     (Mask & RSI_MEM_OPEN) ? "ok" : "missing",
+                     (Mask & RSI_MEM_QUERY) ? "ok" : "missing",
+                     (Mask & RSI_MEM_READ) ? "ok" : "missing",
+                     (void*)Module);
+}
+
+static void
+ArmMemoryObservers(
+    _In_ HMODULE Engine)
+{
+    const BYTE* base = (const BYTE*)Engine;
+    HMODULE kernel32;
+    HMODULE ntdll;
+    DWORD   timeDateStamp = 0;
+    DWORD   sizeOfImage = 0;
+    BOOL    haveIdentity;
+    LONG    mask = 0;
+
+    if (Engine == NULL) {
+        return;
+    }
+
+    haveIdentity = ReadModuleIdentity(Engine, &timeDateStamp, &sizeOfImage);
+    if (g_MemObserveModule != (PVOID)Engine ||
+        (haveIdentity &&
+         (timeDateStamp != g_MemObserveTimeDateStamp ||
+          sizeOfImage != g_MemObserveSizeOfImage))) {
+        g_MemObserveModule = (PVOID)Engine;
+        g_MemObserveTimeDateStamp = timeDateStamp;
+        g_MemObserveSizeOfImage = sizeOfImage;
+        g_OpenProcessSlot = NULL;
+        g_VirtualQuerySlot = NULL;
+        g_NtReadSlot = NULL;
+        g_MemObserveMask = -1;
+        InterlockedExchange(&g_MemObserveActive, 0);
+    }
+
+    kernel32 = GetModuleHandleW(L"kernel32.dll");
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+
+    if (g_RealOpenProcess == NULL && kernel32 != NULL) {
+        g_RealOpenProcess = (RSI_OPEN_PROCESS_FN)
+            GetProcAddress(kernel32, "OpenProcess");
+    }
+    if (g_RealVirtualQueryEx == NULL && kernel32 != NULL) {
+        g_RealVirtualQueryEx = (RSI_VIRTUAL_QUERY_EX_FN)
+            GetProcAddress(kernel32, "VirtualQueryEx");
+    }
+    if (g_RealNtReadVirtualMemory == NULL && ntdll != NULL) {
+        g_RealNtReadVirtualMemory = (RSI_NT_READ_VM_FN)
+            GetProcAddress(ntdll, "NtReadVirtualMemoryEx");
+        if (g_RealNtReadVirtualMemory == NULL) {
+            g_RealNtReadVirtualMemory = (RSI_NT_READ_VM_FN)
+                GetProcAddress(ntdll, "NtReadVirtualMemory");
+        }
+    }
+
+    if (g_OpenProcessSlot == NULL && g_RealOpenProcess != NULL) {
+        g_OpenProcessSlot = FindIatSlot(Engine, "KERNEL32.dll",
+                                        "OpenProcess");
+    }
+    if (g_VirtualQuerySlot == NULL && g_RealVirtualQueryEx != NULL) {
+        g_VirtualQuerySlot = FindIatSlot(Engine, "KERNEL32.dll",
+                                         "VirtualQueryEx");
+    }
+    if (g_NtReadSlot == NULL && g_RealNtReadVirtualMemory != NULL) {
+        BYTE* readAddress = (BYTE*)(base + RSI_ENGINE_NTREAD_RVA);
+        MEMORY_BASIC_INFORMATION memoryInfo;
+        PVOID current = NULL;
+
+        if (VirtualQuery(readAddress, &memoryInfo, sizeof(memoryInfo)) != 0 &&
+            memoryInfo.State == MEM_COMMIT &&
+            (memoryInfo.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+            (memoryInfo.Protect &
+             (PAGE_READWRITE | PAGE_WRITECOPY |
+              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
+            ReadTargetPointer(readAddress, &current) &&
+            (current == NULL ||
+             current == (PVOID)Hook_NtReadVirtualMemory ||
+             IsNtdllPointer(current, ntdll))) {
+            g_NtReadSlot = (void**)readAddress;
+        }
+    }
+
+    if (g_OpenProcessSlot != NULL &&
+        EnsureSlot(g_OpenProcessSlot, (PVOID)Hook_OpenProcess)) {
+        mask |= RSI_MEM_OPEN;
+    }
+    if (g_VirtualQuerySlot != NULL &&
+        EnsureSlot(g_VirtualQuerySlot, (PVOID)Hook_VirtualQueryEx)) {
+        mask |= RSI_MEM_QUERY;
+    }
+    if (g_NtReadSlot != NULL &&
+        EnsureSlot(g_NtReadSlot, (PVOID)Hook_NtReadVirtualMemory)) {
+        mask |= RSI_MEM_READ;
+    }
+
+    ReportMemoryObserverMask(Engine, mask);
+}
+
 /*
  * (Re)install the __rsignal detour. mpengine.dll is unloaded and reloaded by
  * MpSvc (engine refresh/idle unload), which drops the inline patch and can
@@ -2242,6 +2796,7 @@ HookMaintenanceThread(
             g_EngineModuleBase = (PVOID)engine;
             (void)TryInstallHook(engine);
             ArmEngineLog((const BYTE*)engine);
+            ArmMemoryObservers(engine);
         } else {
             g_EngineModuleBase = NULL;
         }
@@ -2448,6 +3003,14 @@ InstallHooksThread(
         return 0;
     }
     EmitStatusInfoV(0, "%s @ 0x%p", MPENGINE_DLL_NAME, (void*)engine);
+
+    /*
+     * The memory observers are data patches, not Detours code patches, so
+     * install them before the __rsignal transaction: they keep working when
+     * the target has ACG and the Detours commit is refused.  The maintenance
+     * thread re-arms them after an engine reload.
+     */
+    ArmMemoryObservers(engine);
 
     g_Real__rsignal = (PFN___rsignal)
         GetProcAddress(engine, MPENGINE_HOOK_EXPORT);
