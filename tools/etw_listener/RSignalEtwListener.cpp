@@ -6,6 +6,11 @@
  * its events on the console. The contract (provider GUID, event names and
  * field names) lives in shared\MpEngineEtw.h.
  *
+ * Besides RSignalCall/RSignalReturn/Status, the provider carries EngineLog
+ * and EngineTrace: the engine's own text lines ("Engine: ...", "Engine-HIPS:
+ * ...") and the structured records (deferred scan requests, telemetry)
+ * captured by the payload's engine trace-callback hook.
+ *
  * Example:
  *
  *     rsignal_etw_listener.exe --out rsignal.txt
@@ -53,6 +58,8 @@ struct Options {
     size_t         dumpBytes = 512;      /* 0 = print everything */
     uint64_t       maxEvents = 0;        /* 0 = unlimited */
     bool           showStatus = true;
+    bool           showEngineLog = true;
+    bool           showEngineTrace = true;
 };
 
 Options                g_options;
@@ -426,6 +433,218 @@ HandleStatusEvent(
 }
 
 void
+TrimTrailingWhitespace(
+    _Inout_ std::string& Text)
+{
+    while (!Text.empty()) {
+        char value = Text.back();
+
+        if (value != '\r' && value != '\n' && value != ' ' && value != '\t') {
+            break;
+        }
+        Text.pop_back();
+    }
+}
+
+/*
+ * EngineLog is produced by the payload's engine trace-callback hook, not by
+ * the __rsignal path. It carries the engine's own text lines ("Engine: ...",
+ * "Engine-HIPS: ...") as Module + Message, so they render verbatim.
+ */
+void
+HandleEngineLogEvent(
+    _In_ krabs::parser& Parser,
+    _In_ const EVENT_RECORD& Record,
+    _In_ const std::string& Prefix)
+{
+    uint32_t    sequence = 0;
+    uint32_t    kind = 0;
+    uint32_t    level = 0;
+    std::string module;
+    std::string message;
+
+    Parser.try_parse(L"SeqNum", sequence);
+    Parser.try_parse(L"Kind", kind);
+    Parser.try_parse(L"Level", level);
+    (void)Parser.try_parse(L"Module", module);
+    (void)Parser.try_parse(L"Message", message);
+
+    if (!g_options.showEngineLog) {
+        return;
+    }
+
+    TrimTrailingWhitespace(message);
+
+    if (g_options.jsonlFormat) {
+        PrintJson(Format("{\"k\":\"elog\",\"seq\":%lu,\"ts\":%llu,"
+                         "\"pid\":%lu,\"tid\":%lu,\"kind\":\"0x%X\","
+                         "\"level\":%lu,\"module\":\"%s\",\"message\":\"%s\"}\n",
+                         (unsigned long)sequence,
+                         (unsigned long long)WallClockTimestamp(Record),
+                         (unsigned long)Record.EventHeader.ProcessId,
+                         (unsigned long)Record.EventHeader.ThreadId,
+                         (unsigned int)kind,
+                         (unsigned long)level,
+                         JsonEscape(module).c_str(),
+                         JsonEscape(message).c_str()));
+        return;
+    }
+
+    if (message.empty()) {
+        /* Older payloads carried structured kinds as empty EngineLog events;
+         * current payloads use EngineTrace for those. */
+        Print(Format("%s engine record kind=0x%X\n",
+                     Prefix.c_str(), (unsigned int)kind));
+        return;
+    }
+
+    if (module.empty()) {
+        Print(Format("%s engine log: %s\n",
+                     Prefix.c_str(), message.c_str()));
+    } else {
+        Print(Format("%s engine log: %s: %s\n",
+                     Prefix.c_str(), module.c_str(), message.c_str()));
+    }
+}
+
+const char*
+EngineTraceKindLabel(
+    _In_ uint32_t Kind)
+{
+    switch (Kind) {
+    case 0x19:
+        return "text log";
+    case 0x28:
+        return "host work item (scan request)";
+    case 0x0B:
+        return "host event";
+    case 0x18:
+    case 0x1C:
+    case 0x1E:
+    case 0x20:
+    case 0x46:
+    case 0x4C:
+    case 0x62:
+        return "engine telemetry";
+    default:
+        return "engine record";
+    }
+}
+
+/*
+ * EngineTrace is produced by the payload's engine trace-callback hook. Kind
+ * 0x28 is the engine's deferred scan request; the other kinds are structured
+ * telemetry whose payload is attached as bounded hex for offline decoding.
+ */
+void
+HandleEngineTraceEvent(
+    _In_ krabs::parser& Parser,
+    _In_ const EVENT_RECORD& Record,
+    _In_ const std::string& Prefix)
+{
+    uint32_t    sequence = 0;
+    uint32_t    kind = 0;
+    uint32_t    opcode = 0;
+    uint32_t    flags = 0;
+    uint32_t    version = 0;
+    uint32_t    id = 0;
+    uint32_t    payloadLength = 0;
+    uint64_t    engineTime = 0;
+    std::string kindName;
+    std::string target;
+    std::string payloadHex;
+
+    if (!g_options.showEngineTrace) {
+        return;
+    }
+
+    Parser.try_parse(L"SeqNum", sequence);
+    Parser.try_parse(L"Kind", kind);
+    Parser.try_parse(L"EngineTime", engineTime);
+    Parser.try_parse(L"Opcode", opcode);
+    Parser.try_parse(L"Flags", flags);
+    Parser.try_parse(L"Version", version);
+    Parser.try_parse(L"Id", id);
+    Parser.try_parse(L"PayloadLength", payloadLength);
+    (void)Parser.try_parse(L"KindName", kindName);
+    (void)Parser.try_parse(L"Target", target);
+    (void)Parser.try_parse(L"PayloadHex", payloadHex);
+
+    std::vector<BYTE> payload;
+    if (!payloadHex.empty()) {
+        (void)HexDecode(payloadHex, payload);
+    }
+
+    if (g_options.jsonlFormat) {
+        PrintJson(Format("{\"k\":\"trace\",\"seq\":%lu,\"ts\":%llu,"
+                         "\"pid\":%lu,\"tid\":%lu,\"kind\":\"0x%X\","
+                         "\"kind_name\":\"%s\",\"target\":\"%s\","
+                         "\"opcode\":%lu,\"flags\":%lu,\"version\":%lu,"
+                         "\"id\":%lu,\"payload_len\":%lu,"
+                         "\"payload_hex\":\"%s\",\"engine_time\":%llu}\n",
+                         (unsigned long)sequence,
+                         (unsigned long long)WallClockTimestamp(Record),
+                         (unsigned long)Record.EventHeader.ProcessId,
+                         (unsigned long)Record.EventHeader.ThreadId,
+                         (unsigned int)kind,
+                         JsonEscape(kindName).c_str(),
+                         JsonEscape(target).c_str(),
+                         (unsigned long)opcode,
+                         (unsigned long)flags,
+                         (unsigned long)version,
+                         (unsigned long)id,
+                         (unsigned long)payloadLength,
+                         payloadHex.c_str(),
+                         (unsigned long long)engineTime));
+        return;
+    }
+
+    if (kind == 0x28) {
+        Print(Format("%s engine scan request : kind=%s target=%s id=0x%02lX "
+                     "opcode=0x%02lX version=%lu flags=0x%lX\n",
+                     Prefix.c_str(),
+                     kindName.empty() ? "?" : kindName.c_str(),
+                     target.empty() ? "?" : target.c_str(),
+                     (unsigned long)id,
+                     (unsigned long)opcode,
+                     (unsigned long)version,
+                     (unsigned long)flags));
+        return;
+    }
+
+    std::string text = Format("%s engine trace : kind=0x%X (%s)",
+                              Prefix.c_str(),
+                              (unsigned int)kind,
+                              EngineTraceKindLabel(kind));
+
+    if (!kindName.empty() || !target.empty()) {
+        text += Format(" kind_name=%s target=%s",
+                       kindName.empty() ? "?" : kindName.c_str(),
+                       target.empty() ? "?" : target.c_str());
+    }
+
+    size_t shownBytes = payload.empty() ? payloadLength : payload.size();
+
+    if (shownBytes == 0) {
+        text += "\n";
+        Print(text);
+        return;
+    }
+
+    size_t previewChars = payloadHex.size() < 64 ? payloadHex.size() : 64;
+    text += Format(" payload=%llu byte(s) hex=%s%s\n",
+                   (unsigned long long)shownBytes,
+                   payloadHex.substr(0, previewChars).c_str(),
+                   previewChars < payloadHex.size() ? "..." : "");
+
+    if (g_options.dump && !payload.empty()) {
+        DumpBytes(text, "payload", payload, g_options.dumpBytes);
+    }
+
+    Print(text);
+}
+
+void
 HandleCallEvent(
     _In_ krabs::parser& Parser,
     _In_ const EVENT_RECORD& Record,
@@ -635,6 +854,12 @@ OnEvent(
         case MPENGINE_ETW_TYPE_STATUS:
             HandleStatusEvent(parser, Record, prefix);
             break;
+        case MPENGINE_ETW_TYPE_ENGINE_LOG:
+            HandleEngineLogEvent(parser, Record, prefix);
+            break;
+        case MPENGINE_ETW_TYPE_TRACE:
+            HandleEngineTraceEvent(parser, Record, prefix);
+            break;
         default:
             Print(Format("%s event=%s (unknown type %lu)\n",
                          prefix.c_str(),
@@ -673,7 +898,7 @@ Usage(void)
         "                     combine with --format jsonl for one aligned pair\n"
         "  --format <format>  output format: text (default), binary or jsonl\n"
         "                     binary writes CALL payloads as EV + signal ID + size + data\n"
-        "                     jsonl writes one JSON object per CALL/RETURN/Status event\n"
+        "                     jsonl writes one JSON object per event\n"
         "  --context          jsonl: also emit ContextAddress/Length/Hex\n"
         "  --dump             print a hex+ASCII dump of the data buffer\n"
         "  --dump-bytes <n>   bytes of the buffer to dump (implies --dump;\n"
@@ -682,6 +907,8 @@ Usage(void)
         "                     data address and size\n"
         "  --max-events <n>   stop after n events\n"
         "  --quiet-status     hide Status (install/diagnostic) events\n"
+        "  --quiet-engine-log hide EngineLog (engine's own log lines) events\n"
+        "  --quiet-trace      hide EngineTrace (structured engine records)\n"
         "  --help             show this text\n"
         "\n"
         "Run elevated (or as a member of Performance Log Users). Start the\n"
@@ -789,6 +1016,10 @@ ParseOptions(
             }
         } else if (argument == L"--quiet-status") {
             g_options.showStatus = false;
+        } else if (argument == L"--quiet-engine-log") {
+            g_options.showEngineLog = false;
+        } else if (argument == L"--quiet-trace") {
+            g_options.showEngineTrace = false;
         } else {
             fprintf(stderr, "unknown argument: %ls\n", argument.c_str());
             Usage();

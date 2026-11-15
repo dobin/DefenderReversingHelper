@@ -590,6 +590,8 @@ change. `allow-dynamic-code` should change the ACG line to `off`.
 | 14 | DLL injector | `injector.exe` loads `payload.dll` into a normal target; `MsMpEng.exe` accepts it with `--ppl --fix-handle --kernel-thread`; `--restore` returns protection to `0x31` |
 | 15 | allow-dynamic-code | `query` shows `MitigationFlags1` bit 8 cleared; `clear` restores it together with any `allow-dlls` change |
 | 16 | Detours payload | `mpengine_hook.dll` emits `Detours hook installed` for `__rsignal` inside `MsMpEng.exe` with `--ppl --allow-dynamic-code --fix-handle --kernel-thread`; `rsignal_etw_listener.exe` shows `RSignalCall`/`RSignalReturn` summaries (add `--dump` for hex dumps) |
+| 17 | Engine log capture | After the same injection, a status event `engine log capture armed: instance=... slot=+0xB00 ... abi=1` appears and the listener prints the engine's own `engine log: Engine-HIPS: ...` / `Engine: ...` lines during a scan or `MpCmdRun -GetFiles`; after an engine reload the same status events repeat (re-arm) and events keep flowing. If the slot cannot be read/written, a `Status` error names the instance/slot once instead of silently doing nothing. |
+| 18 | Engine trace records | With the same injection, the listener prints `engine scan request : kind=ems target=... id=0x8E opcode=0x22 ...` for a deferred scan and `engine trace : kind=0x1C (engine telemetry) payload=...` for the structured kinds; `--dump` shows the captured payload and `--quiet-trace` hides them |
 
 ## Troubleshooting
 

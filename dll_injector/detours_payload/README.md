@@ -45,6 +45,12 @@ block or modify anything. For each call it emits:
 2. `RSignalReturn` — the return value.
 3. `Status` — install/diagnostic messages (`payload attached`,
    `Detours hook installed`, failures) with a Win32 error code where relevant.
+4. `EngineLog` — the engine's own log lines (`Engine: ...`,
+   `Engine-HIPS: ...`), captured from the engine trace callback rather than
+   from `__rsignal` (see below).
+5. `EngineTrace` — the structured records handed to the same callback:
+   deferred scan requests (`kind 0x28`, decoded) and engine telemetry kinds
+   with a bounded payload hex copy (see below).
 
 Event field names and types are listed in `shared/MpEngineEtw.h`. Because the
 `Status`/`RSignalCall` events are ordinary `TraceLoggingWrite` calls, they can
@@ -61,6 +67,99 @@ no-op: the payload does not even read the `Context`/`Data` buffers. With a
 listener attached, the buffers are copied and hex-encoded into events of up to
 ~9.5 KB each. ETW drops events (rather than blocking) if the consumer cannot
 keep up; that is expected under heavy scan load.
+
+## Engine log capture
+
+The payload also captures the engine's own log lines:
+
+```text
+engine log: Engine-HIPS: Loaded ASR vdm rule "Block Win32 API calls from Office macro", ...
+engine log: Engine: EMS scan for process: pid_8172 pid: 8172, sigseq: 0x454D53CF, ...
+```
+
+Those are not WPP traces (the `advapi32!TraceMessage` path is gated off unless
+an ETW session enables it, and its text lives in a TMF that is not shipped).
+mpengine formats each line in memory and hands it to a callback stored on the
+process-wide engine instance; MpSvc installs that callback. The payload's
+`HookMaintenanceThread` waits for the instance, replaces the callback with
+`Hook_EngineTrace`, and forwards every record to the previous sink, so
+Defender's own logging is unchanged.
+
+Record layout (mpengine 1.1.26100.4 — re-check the RVAs per engine build):
+
+| item | value |
+|---|---|
+| instance global | `mpengine + 0x111E110` |
+| instance sanity check | `*(void**)instance == mpengine + 0x2EA820` |
+| trace ABI selector | `mpengine + 0x10D0738` (`1` → legacy slot) |
+| callback slots | `+0xB00` legacy, `+0xB08` new ABI, `+0xB10` context |
+| record | `+0x00 kind`, `+0x08 timestamp`, `+0x10 payload` |
+| kind `0x19` payload | `+0x00 level`, `+0x08 flags`, `+0x10 log*` |
+| kind `0x19` log | `+0x00 module`, `+0x08 level`, `+0x10 bytes`, `+0x18 message` |
+
+`kind 0x19` (text log) is emitted as an `EngineLog` event. The structured
+records are emitted as `EngineTrace` events:
+
+- `kind 0x28` is a deferred scan request. The payload decodes the work item
+  (`opcode`, `flags`, `kind`, `target`, `version`, `id`) so the listener can
+  print e.g. `engine scan request : kind=ems target=pid:8172 id=0x8E
+  opcode=0x22 version=1 flags=0x1`. This is the engine's own "scan this
+  process" decision and is emitted regardless of the other-kinds switch.
+- `kind 0x18`/`0x1C`/`0x1E`/`0x20`/`0x46`/`0x4C`/`0x62` (engine telemetry)
+  attach a bounded hex copy of the record payload
+  (`RSI_ENGINE_TRACE_DUMP_BYTES`, default 256) so the fields can be decoded
+  offline without rebuilding the payload. `RSI_ENGINE_CAPTURE_OTHER_KINDS=1`
+  (the default) enables this; set it to `0` to emit only the text log and
+  scan requests.
+
+Caveats:
+
+- The callback slot only exists after MpSvc boots the engine. The watchdog
+  starts with the hook and arms as soon as the instance appears, so lines
+  produced before that (the ASR rule dump at boot) are missed when injecting
+  into an already-running `MsMpEng.exe`. Trigger `RSIG_GENERATE_SUPPORT_LOG`
+  (0x4080) to make the engine dump its diagnostics again.
+- Message pointers are engine-owned and valid only during the callback; the
+  hook copies them before forwarding.
+- If the engine reboots (`RSIG_UNLOADENGINE`, 0x400a) the watchdog re-takes
+  the slot.
+
+## Surviving engine reloads
+
+`MpSvc` unloads and reloads `mpengine.dll` in place (engine refresh, idle
+unload), and the module can come back at a **different base**. That drops the
+inline Detours patch on `__rsignal` and replaces the engine instance, so a
+one-shot hook stops producing events after a few minutes even though the
+payload DLL is still loaded.
+
+`mpengine_hook.dll` therefore runs one maintenance thread per process. Every
+250 ms it:
+
+1. resolves `GetModuleHandleW(L"mpengine.dll")` again,
+2. compares the 16 bytes at `__rsignal` with the prologue saved before the
+   first patch — if they match, the module is fresh and the detour is
+   re-attached (with a 30 s backoff if the install fails, e.g. because ACG was
+   restored),
+3. re-arms the engine trace slot on the *current* engine instance.
+
+The re-installs are visible in the listener as repeated `Status` events:
+
+```text
+Detours hook installed: mpengine.dll!__rsignal -> 0x...
+engine log capture armed: instance=0x... slot=+0xB00 original=0x... abi=1
+```
+
+If the instance layout no longer matches the build, or the slot cannot be read or
+written, the payload emits a `Status` error naming the instance and slot instead
+of silently capturing nothing.
+
+For deeper troubleshooting, compile the payload with `RSI_DIAG_LOG=1`
+(`#define RSI_DIAG_LOG` in `MpEngineHook.c`): it appends a stage log to
+`C:\data\mpengine_hook_<pid>.log` (DllMain, `TraceLoggingRegister` result,
+hook install result, slot arming). It is off by default, so the released
+payload writes nothing to disk.
+
+
 
 ## Build
 
@@ -184,8 +283,9 @@ function, resolve it with a signature/pattern scan and pass that address to
 ## Removing the hook
 
 The hook is intentionally left installed for the life of the process. Do not
-`FreeLibrary` the payload: Detours keeps a trampoline inside this DLL, so
-unloading it would leave `mpengine` calling into unmapped memory. Terminate or
+`FreeLibrary` the payload: Detours keeps a trampoline inside this DLL, and the
+engine trace callback slot points straight at `Hook_EngineTrace`, so unloading
+the DLL would leave `mpengine` calling into unmapped memory. Terminate or
 restart `MsMpEng.exe`/the test process to remove it.
 
 ## Caveats

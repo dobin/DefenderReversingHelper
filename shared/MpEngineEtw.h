@@ -23,14 +23,18 @@
     L"DefenderReversingHelper-MpEngineRSignal"
 
 /* Event names, used only for display; the "Type" field is authoritative. */
-#define MPENGINE_ETW_EVENT_CALL   "RSignalCall"
-#define MPENGINE_ETW_EVENT_RETURN "RSignalReturn"
-#define MPENGINE_ETW_EVENT_STATUS "Status"
+#define MPENGINE_ETW_EVENT_CALL       "RSignalCall"
+#define MPENGINE_ETW_EVENT_RETURN     "RSignalReturn"
+#define MPENGINE_ETW_EVENT_STATUS     "Status"
+#define MPENGINE_ETW_EVENT_ENGINE_LOG "EngineLog"
+#define MPENGINE_ETW_EVENT_TRACE      "EngineTrace"
 
 /* Value of the first field ("Type") of every event. */
-#define MPENGINE_ETW_TYPE_CALL   1u
-#define MPENGINE_ETW_TYPE_RETURN 2u
-#define MPENGINE_ETW_TYPE_STATUS 3u
+#define MPENGINE_ETW_TYPE_CALL       1u
+#define MPENGINE_ETW_TYPE_RETURN     2u
+#define MPENGINE_ETW_TYPE_STATUS     3u
+#define MPENGINE_ETW_TYPE_ENGINE_LOG 4u
+#define MPENGINE_ETW_TYPE_TRACE      5u
 
 /*
  * Field names, for reference:
@@ -43,6 +47,27 @@
  *   RSignalReturn Type(UInt32) SeqNum(UInt32) Status(UInt32)
  *
  *   Status        Type(UInt32) SeqNum(UInt32) Code(UInt32) Message(String)
+ *
+ *   EngineLog     Type(UInt32) SeqNum(UInt32) Kind(UInt32) Level(UInt32)
+ *                 Module(String) Message(String)
+ *
+ *   EngineTrace   Type(UInt32) SeqNum(UInt32) Kind(UInt32) EngineTime(UInt64)
+ *                 Opcode(UInt32) Flags(UInt32) Version(UInt32) Id(UInt32)
+ *                 KindName(String) Target(String) PayloadLength(UInt32)
+ *                 PayloadHex(String)
+ *
+ * EngineLog carries the engine's own diagnostic lines (module "Engine",
+ * "Engine-HIPS", ...) captured from the trace callback in the engine instance,
+ * not from the WPP/TraceMessage path.  Kind is the engine record kind
+ * (0x19 = text log); Level is the engine's own level for that line.
+ *
+ * EngineTrace carries the structured records handed to the same callback.
+ * Kind 0x28 is a host work item (deferred scan request): Opcode is 0x22 for a
+ * scan, Flags/Version/Id come from the work payload, KindName is L"ems" /
+ * L"process" and Target is the engine's target expression.  For other kinds
+ * (0x18/0x1C/0x1E/0x20/0x46/0x4C/0x62 telemetry) the decoded fields are zero
+ * and PayloadHex is a bounded hex copy of the payload for offline decoding.
+ * PayloadHex is uppercase hex text, like ContextHex/DataHex.
  *
  * ContextHex/DataHex are uppercase hex text (two characters per captured
  * byte). Hex travels as a plain string so any consumer decodes the same bytes

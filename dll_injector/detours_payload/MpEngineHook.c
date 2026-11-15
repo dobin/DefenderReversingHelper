@@ -22,6 +22,20 @@
  *     RSignalReturn  the return value
  *     Status         install/diagnostic messages ("payload attached", errors)
  *
+ * The same DLL also captures the engine's own log lines ("Engine: ...",
+ * "Engine-HIPS: ...").  Those are not WPP: mpengine formats them and calls a
+ * trace callback stored on the process-wide engine instance, and MpSvc
+ * installs that callback.  Hook_EngineTrace replaces the callback and forwards
+ * to the previous value, so Defender keeps behaving exactly as before.  Each
+ * line travels as an EngineLog event (see the "Engine log capture" section
+ * below for the layout).
+ *
+ * MpSvc unloads and reloads mpengine.dll in place (engine refresh/idle unload)
+ * and can remap it at a different base, which drops the inline patch and
+ * replaces the engine instance.  HookMaintenanceThread therefore re-resolves
+ * the module every 250 ms, re-attaches the detour when the original prologue is
+ * back, and re-arms the trace slot on the current instance.
+ *
  * When no ETW session has the provider enabled, TraceLoggingWrite is a cheap
  * no-op and the buffers are not even read.
  *
@@ -285,6 +299,48 @@ EmitStatusErrorV(
 
     EmitStatusError(Code, message);
 }
+
+/*
+ * Optional stage log for diagnosing a payload that loads but never emits.
+ * Disabled by default: the released payload writes nothing to disk.
+ */
+#ifndef RSI_DIAG_LOG
+#define RSI_DIAG_LOG 0
+#endif
+
+#if RSI_DIAG_LOG
+static void
+DiagLog(
+    _In_ const char* Format,
+    ...)
+{
+    char    path[MAX_PATH];
+    char    message[512];
+    HANDLE  file;
+    DWORD   written = 0;
+    va_list arguments;
+
+    _snprintf_s(path, sizeof(path), _TRUNCATE,
+                "C:\\data\\mpengine_hook_%lu.log",
+                (unsigned long)GetCurrentProcessId());
+    file = CreateFileA(path, FILE_APPEND_DATA,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    va_start(arguments, Format);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, Format, arguments);
+    va_end(arguments);
+
+    (void)WriteFile(file, message, (DWORD)strlen(message), &written, NULL);
+    (void)WriteFile(file, "\r\n", 2, &written, NULL);
+    CloseHandle(file);
+}
+#else
+#define DiagLog(...) ((void)0)
+#endif
 
 /*
  * Copy up to Capacity bytes from Address into Buffer. Reads only the part of
@@ -928,6 +984,684 @@ EmitReturn(
 }
 
 /* ------------------------------------------------------------------------- */
+/* Engine log capture (engine trace callback)                                */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * mpengine has two independent diagnostic paths:
+ *
+ *   WPP / advapi32!TraceMessage   high-volume debug trace.  Every call site
+ *                                 is gated on flags in the WPP control block,
+ *                                 so nothing is produced unless an ETW
+ *                                 session enables it, and the message text
+ *                                 lives in a TMF that is not shipped.
+ *
+ *   engine trace callback         the engine log lines Defender writes to
+ *                                 MPLog ("Engine: ...", "Engine-HIPS: ...").
+ *                                 Text is formatted in memory, so it can be
+ *                                 captured without any ETW enablement.
+ *
+ * Every text line is formatted inside mpengine (EngineLog ->
+ * FUN_180335738 -> FUN_180335884) and handed to a callback stored on the
+ * process-wide engine instance.  MpSvc installs that callback, so replacing
+ * it and forwarding to the previous value observes the lines without changing
+ * engine behaviour.
+ *
+ * Instance layout, mpengine 1.1.26100.4 (re-check per engine build):
+ *
+ *   DAT_18111e110                    engine instance global
+ *     +0x000  dispatcher             FUN_1802ea820
+ *     +0xB00  trace callback         legacy ABI; selector DAT_1810d0738 == 1
+ *     +0xB08  trace callback         new ABI (unused in this build)
+ *     +0xB10  trace context          stored, not passed to the callback
+ *
+ * Record handed to the callback:
+ *
+ *   +0x00  u64 kind                 0x19 = text log
+ *   +0x08  u64 timestamp
+ *   +0x10  ptr payload
+ *
+ * kind 0x19 payload:
+ *
+ *   +0x00  u32 level
+ *   +0x08  u64 flags
+ *   +0x10  ptr log
+ *
+ * kind 0x19 log (pointers are engine-owned and valid only during the call):
+ *
+ *   +0x00  const wchar_t *module    L"Engine", L"Engine-HIPS", ...
+ *   +0x08  u32 level
+ *   +0x10  u64 bytes                message length in bytes, including NUL
+ *   +0x18  const wchar_t *message
+ *
+ * The engine boots asynchronously, so the slot is polled until the instance
+ * appears (and re-taken if the engine reboots and overwrites it).
+ */
+#define RSI_ENGINE_INSTANCE_RVA     0x111E110u
+#define RSI_ENGINE_DISPATCHER_RVA   0x2EA820u
+#define RSI_ENGINE_TRACE_ABI_RVA    0x10D0738u
+#define RSI_ENGINE_TRACE_FN_LEGACY  0x0B00u
+#define RSI_ENGINE_TRACE_FN_NEW     0x0B08u
+
+#define RSI_ENGINE_RECORD_TIME      0x08u
+#define RSI_ENGINE_RECORD_PAYLOAD   0x10u
+#define RSI_ENGINE_PAYLOAD_LEVEL    0x00u
+#define RSI_ENGINE_PAYLOAD_LOG      0x10u
+#define RSI_ENGINE_LOG_MODULE       0x00u
+#define RSI_ENGINE_LOG_LENGTH       0x10u
+#define RSI_ENGINE_LOG_MESSAGE      0x18u
+
+#define RSI_ENGINE_KIND_LOG         0x19u
+#define RSI_ENGINE_KIND_WORK        0x28u
+
+/*
+ * Kind 0x28 is a host work item.  The engine builds it for a deferred scan and
+ * calls the same instance callback as the text log:
+ *
+ *   record  +0x10  ptr payload
+ *   payload +0x00  u32 opcode   (0x22 = deferred scan request)
+ *           +0x04  u32 flags
+ *           +0x08  ptr args
+ *   args    +0x00  wchar_t *kind    (L"ems", L"process", ...)
+ *           +0x08  wchar_t *target  ("pid:1234", "ppids:{...}")
+ *           +0x10  u16 version
+ *           +0x12  u16 id          (0x8e for "ems")
+ */
+#define RSI_ENGINE_WORK_OPCODE_DEFERRED 0x22u
+#define RSI_ENGINE_WORK_PAYLOAD_OPCODE  0x00u
+#define RSI_ENGINE_WORK_PAYLOAD_FLAGS   0x04u
+#define RSI_ENGINE_WORK_PAYLOAD_ARGS    0x08u
+#define RSI_ENGINE_WORK_ARGS_KIND       0x00u
+#define RSI_ENGINE_WORK_ARGS_TARGET     0x08u
+#define RSI_ENGINE_WORK_ARGS_VERSION    0x10u
+#define RSI_ENGINE_WORK_ARGS_ID         0x12u
+
+/* Also emit the structured records (scan work items, telemetry). */
+#ifndef RSI_ENGINE_CAPTURE_OTHER_KINDS
+#define RSI_ENGINE_CAPTURE_OTHER_KINDS 1
+#endif
+
+#ifndef RSI_ENGINE_MODULE_CHARS
+#define RSI_ENGINE_MODULE_CHARS 96
+#endif
+#ifndef RSI_ENGINE_MESSAGE_CHARS
+#define RSI_ENGINE_MESSAGE_CHARS 1024
+#endif
+#ifndef RSI_ENGINE_WORK_KIND_CHARS
+#define RSI_ENGINE_WORK_KIND_CHARS 64
+#endif
+#ifndef RSI_ENGINE_WORK_TARGET_CHARS
+#define RSI_ENGINE_WORK_TARGET_CHARS 256
+#endif
+
+/* Bounded payload copy attached to unknown/telemetry trace records. */
+#ifndef RSI_ENGINE_TRACE_DUMP_BYTES
+#define RSI_ENGINE_TRACE_DUMP_BYTES 256
+#endif
+
+#define RSI_ENGINE_LOG_POLL_MS 250
+
+/* Maximum number of threads enlisted in one Detours transaction. */
+#ifndef MAX_ENLISTED_THREADS
+#define MAX_ENLISTED_THREADS 4096
+#endif
+
+typedef LONG (WINAPI *PFN_ENGINE_TRACE)(const void* Record);
+
+static PFN_ENGINE_TRACE g_RealEngineTrace = NULL;
+static PVOID g_LastEngineInstance = NULL;
+static PVOID g_LastArmFailureInstance = NULL;
+static volatile LONG g_EngineLogArmed = 0;
+static volatile LONG g_EngineLogCalls = 0;
+static volatile LONG g_EngineTraceCalls = 0;
+static __declspec(thread) LONG g_InEngineLog = 0;
+
+/* Detours state for the maintenance thread: the module can be unmapped and
+ * reloaded under us, so the hook is re-installed whenever the target address
+ * or its prologue changes. */
+static PVOID g_HookedTarget = NULL;
+static BYTE  g_HookedPrologue[16];
+static BOOL  g_HookedPrologueValid = FALSE;
+static ULONGLONG g_NextInstallAttempt = 0;
+
+#ifndef RSI_HOOK_RETRY_MS
+#define RSI_HOOK_RETRY_MS 30000
+#endif
+
+static DWORD
+EnlistProcessThreads(
+    _Out_writes_to_(Capacity, return) HANDLE* Handles,
+    _In_ DWORD Capacity);
+
+static void
+ReleaseThreadHandles(
+    _In_reads_(Count) HANDLE* Handles,
+    _In_ DWORD Count);
+
+static ULONG WINAPI
+Hook___rsignal(
+    _In_ PVOID Context,
+    _In_ int Signal,
+    _In_ PVOID Data,
+    _In_ int Flags);
+
+static BOOL
+ReadTargetPointer(
+    _In_ const void* Address,
+    _Out_ PVOID* Value)
+{
+    *Value = NULL;
+    return CopyTargetMemory(Address, Value, sizeof(*Value)) == sizeof(*Value);
+}
+
+/*
+ * The slot lives in the engine's heap object, which is normally writable, but
+ * the protection is restored anyway so the write is never conditional on how
+ * the heap allocated the page.
+ */
+static BOOL
+WriteTargetPointer(
+    _In_ void* Address,
+    _In_ PVOID Value)
+{
+    DWORD  previousProtect = 0;
+    SIZE_T written = 0;
+    BOOL   ok;
+
+    if (!VirtualProtect(Address, sizeof(Value), PAGE_READWRITE,
+                        &previousProtect)) {
+        return FALSE;
+    }
+    ok = WriteProcessMemory(GetCurrentProcess(), Address, &Value,
+                            sizeof(Value), &written) != FALSE &&
+         written == sizeof(Value);
+    (void)VirtualProtect(Address, sizeof(Value), previousProtect,
+                         &previousProtect);
+    return ok;
+}
+
+/*
+ * Copy a NUL-terminated wide string out of engine memory. KnownBytes is the
+ * engine's own length for the message (0 when unknown) and bounds the read.
+ */
+static BOOL
+CopyWideString(
+    _Out_writes_z_(Chars) wchar_t* Destination,
+    _In_ SIZE_T Chars,
+    _In_ const wchar_t* Source,
+    _In_opt_ UINT64 KnownBytes)
+{
+    SIZE_T capacity;
+    SIZE_T read;
+    SIZE_T used;
+    SIZE_T i;
+
+    if (Destination == NULL || Chars == 0) {
+        return FALSE;
+    }
+    Destination[0] = L'\0';
+    if (Source == NULL) {
+        return FALSE;
+    }
+
+    capacity = Chars * sizeof(wchar_t);
+    if (KnownBytes != 0 && KnownBytes < capacity) {
+        capacity = (SIZE_T)KnownBytes;
+    }
+    read = CopyTargetMemory(Source, Destination, capacity);
+    used = read / sizeof(wchar_t);
+    if (used == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < used; i++) {
+        if (Destination[i] == L'\0') {
+            return i != 0;
+        }
+    }
+    Destination[(used < Chars) ? used : Chars - 1] = L'\0';
+    return TRUE;
+}
+
+static void
+EmitEngineLog(
+    _In_ UINT32 Kind,
+    _In_ UINT32 Level,
+    _In_opt_ const wchar_t* Module,
+    _In_opt_ const wchar_t* Message)
+{
+    char moduleUtf8[RSI_ENGINE_MODULE_CHARS * 3 + 1];
+    char messageUtf8[RSI_ENGINE_MESSAGE_CHARS * 3 + 1];
+
+    if (!g_ProviderRegistered) {
+        return;
+    }
+
+    moduleUtf8[0] = '\0';
+    messageUtf8[0] = '\0';
+
+    if (Module != NULL && Module[0] != L'\0') {
+        if (WideCharToMultiByte(CP_UTF8, 0, Module, -1, moduleUtf8,
+                                sizeof(moduleUtf8), NULL, NULL) <= 0) {
+            moduleUtf8[0] = '\0';
+        }
+    }
+    if (Message != NULL && Message[0] != L'\0') {
+        if (WideCharToMultiByte(CP_UTF8, 0, Message, -1, messageUtf8,
+                                sizeof(messageUtf8), NULL, NULL) <= 0) {
+            messageUtf8[0] = '\0';
+        }
+    }
+
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_ENGINE_LOG,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_ENGINE_LOG, "Type"),
+        TraceLoggingUInt32((UINT32)InterlockedIncrement(&g_EngineLogCalls),
+                           "SeqNum"),
+        TraceLoggingUInt32(Kind, "Kind"),
+        TraceLoggingUInt32(Level, "Level"),
+        TraceLoggingString(moduleUtf8, "Module"),
+        TraceLoggingString(messageUtf8, "Message"));
+}
+
+static void
+WideToUtf8(
+    _In_opt_ const wchar_t* Text,
+    _Out_writes_z_(Capacity) char* Destination,
+    _In_ SIZE_T Capacity)
+{
+    if (Destination == NULL || Capacity == 0) {
+        return;
+    }
+    Destination[0] = '\0';
+    if (Text == NULL || Text[0] == L'\0') {
+        return;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, Text, -1, Destination,
+                            (int)Capacity, NULL, NULL) <= 0) {
+        Destination[0] = '\0';
+    }
+}
+
+/*
+ * Structured trace record.  Kind 0x28 is decoded; other kinds carry a bounded
+ * hex copy of the payload so they can be decoded offline without another
+ * payload build.
+ */
+static void
+EmitEngineTrace(
+    _In_ UINT32 Kind,
+    _In_ UINT64 EngineTime,
+    _In_ UINT32 Opcode,
+    _In_ UINT32 Flags,
+    _In_ UINT32 Version,
+    _In_ UINT32 Id,
+    _In_opt_ const wchar_t* KindName,
+    _In_opt_ const wchar_t* Target,
+    _In_reads_bytes_opt_(PayloadLength) const BYTE* Payload,
+    _In_ SIZE_T PayloadLength)
+{
+    char kindNameUtf8[RSI_ENGINE_WORK_KIND_CHARS * 3 + 1];
+    char targetUtf8[RSI_ENGINE_WORK_TARGET_CHARS * 3 + 1];
+    char payloadHex[RSI_ENGINE_TRACE_DUMP_BYTES * 2 + 1];
+
+    if (!g_ProviderRegistered) {
+        return;
+    }
+
+    WideToUtf8(KindName, kindNameUtf8, sizeof(kindNameUtf8));
+    WideToUtf8(Target, targetUtf8, sizeof(targetUtf8));
+    payloadHex[0] = '\0';
+
+    if (Payload != NULL && PayloadLength != 0) {
+        if (PayloadLength > RSI_ENGINE_TRACE_DUMP_BYTES) {
+            PayloadLength = RSI_ENGINE_TRACE_DUMP_BYTES;
+        }
+        BytesToHex(Payload, PayloadLength, payloadHex);
+    } else {
+        PayloadLength = 0;
+    }
+
+    TraceLoggingWrite(
+        g_hRSignalProvider,
+        MPENGINE_ETW_EVENT_TRACE,
+        TraceLoggingLevel(TRACE_LEVEL_INFORMATION),
+        TraceLoggingUInt32(MPENGINE_ETW_TYPE_TRACE, "Type"),
+        TraceLoggingUInt32((UINT32)InterlockedIncrement(&g_EngineTraceCalls),
+                           "SeqNum"),
+        TraceLoggingUInt32(Kind, "Kind"),
+        TraceLoggingUInt64(EngineTime, "EngineTime"),
+        TraceLoggingUInt32(Opcode, "Opcode"),
+        TraceLoggingUInt32(Flags, "Flags"),
+        TraceLoggingUInt32(Version, "Version"),
+        TraceLoggingUInt32(Id, "Id"),
+        TraceLoggingString(kindNameUtf8, "KindName"),
+        TraceLoggingString(targetUtf8, "Target"),
+        TraceLoggingUInt32((UINT32)PayloadLength, "PayloadLength"),
+        TraceLoggingString(payloadHex, "PayloadHex"));
+}
+
+static void
+EmitEngineTraceRecord(
+    _In_ const void* Record)
+{
+    const BYTE* record = (const BYTE*)Record;
+    UINT64      kind = 0;
+    UINT64      engineTime = 0;
+    PVOID       payload = NULL;
+
+    if (Record == NULL ||
+        CopyTargetMemory(record, &kind, sizeof(kind)) != sizeof(kind)) {
+        return;
+    }
+
+    (void)CopyTargetMemory(record + RSI_ENGINE_RECORD_TIME,
+                           &engineTime, sizeof(engineTime));
+    (void)ReadTargetPointer(record + RSI_ENGINE_RECORD_PAYLOAD, &payload);
+
+    if (kind == RSI_ENGINE_KIND_LOG) {
+        PVOID   log = NULL;
+        PVOID   module = NULL;
+        PVOID   message = NULL;
+        UINT32  level = 0;
+        UINT64  bytes = 0;
+        wchar_t moduleText[RSI_ENGINE_MODULE_CHARS];
+        wchar_t messageText[RSI_ENGINE_MESSAGE_CHARS];
+
+        if (payload == NULL) {
+            return;
+        }
+        (void)CopyTargetMemory((const BYTE*)payload + RSI_ENGINE_PAYLOAD_LEVEL,
+                               &level, sizeof(level));
+        if (!ReadTargetPointer((const BYTE*)payload + RSI_ENGINE_PAYLOAD_LOG,
+                               &log) ||
+            log == NULL) {
+            return;
+        }
+        (void)ReadTargetPointer((const BYTE*)log + RSI_ENGINE_LOG_MODULE,
+                                &module);
+        (void)CopyTargetMemory((const BYTE*)log + RSI_ENGINE_LOG_LENGTH,
+                               &bytes, sizeof(bytes));
+        (void)ReadTargetPointer((const BYTE*)log + RSI_ENGINE_LOG_MESSAGE,
+                                &message);
+
+        (void)CopyWideString(moduleText, RSI_ENGINE_MODULE_CHARS,
+                             (const wchar_t*)module, 0);
+        (void)CopyWideString(messageText, RSI_ENGINE_MESSAGE_CHARS,
+                             (const wchar_t*)message, bytes);
+        if (messageText[0] == L'\0') {
+            return;
+        }
+
+        EmitEngineLog((UINT32)kind, level, moduleText, messageText);
+        return;
+    }
+
+    if (kind == RSI_ENGINE_KIND_WORK) {
+        PVOID   args = NULL;
+        PVOID   kindTextPtr = NULL;
+        PVOID   targetTextPtr = NULL;
+        UINT32  opcode = 0;
+        UINT32  flags = 0;
+        UINT16  version = 0;
+        UINT16  id = 0;
+        wchar_t kindText[RSI_ENGINE_WORK_KIND_CHARS];
+        wchar_t targetText[RSI_ENGINE_WORK_TARGET_CHARS];
+
+        kindText[0] = L'\0';
+        targetText[0] = L'\0';
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload +
+                                       RSI_ENGINE_WORK_PAYLOAD_OPCODE,
+                                   &opcode, sizeof(opcode));
+            (void)CopyTargetMemory((const BYTE*)payload +
+                                       RSI_ENGINE_WORK_PAYLOAD_FLAGS,
+                                   &flags, sizeof(flags));
+            if (ReadTargetPointer((const BYTE*)payload +
+                                      RSI_ENGINE_WORK_PAYLOAD_ARGS,
+                                  &args) &&
+                args != NULL) {
+                (void)CopyTargetMemory((const BYTE*)args +
+                                           RSI_ENGINE_WORK_ARGS_VERSION,
+                                       &version, sizeof(version));
+                (void)CopyTargetMemory((const BYTE*)args +
+                                           RSI_ENGINE_WORK_ARGS_ID,
+                                       &id, sizeof(id));
+                (void)ReadTargetPointer((const BYTE*)args +
+                                            RSI_ENGINE_WORK_ARGS_KIND,
+                                        &kindTextPtr);
+                (void)ReadTargetPointer((const BYTE*)args +
+                                            RSI_ENGINE_WORK_ARGS_TARGET,
+                                        &targetTextPtr);
+                (void)CopyWideString(kindText, RSI_ENGINE_WORK_KIND_CHARS,
+                                     (const wchar_t*)kindTextPtr, 0);
+                (void)CopyWideString(targetText,
+                                     RSI_ENGINE_WORK_TARGET_CHARS,
+                                     (const wchar_t*)targetTextPtr, 0);
+            }
+        }
+
+        EmitEngineTrace((UINT32)kind, engineTime, opcode, flags,
+                        (UINT32)version, (UINT32)id, kindText, targetText,
+                        NULL, 0);
+        return;
+    }
+
+#if RSI_ENGINE_CAPTURE_OTHER_KINDS
+    {
+        BYTE   payloadBytes[RSI_ENGINE_TRACE_DUMP_BYTES];
+        SIZE_T payloadRead = 0;
+
+        if (payload != NULL) {
+            payloadRead = CopyTargetMemory(payload, payloadBytes,
+                                           sizeof(payloadBytes));
+        }
+        EmitEngineTrace((UINT32)kind, engineTime, 0, 0, 0, 0, NULL, NULL,
+                        (payloadRead != 0) ? payloadBytes : NULL,
+                        payloadRead);
+    }
+#endif
+}
+
+static LONG WINAPI
+Hook_EngineTrace(
+    _In_ const void* Record)
+{
+    PFN_ENGINE_TRACE real = g_RealEngineTrace;
+    LONG status;
+
+    /*
+     * Bounded recursion guard: if the sink installed by MpSvc logs back into
+     * the engine, the nested record is still forwarded but not emitted twice.
+     */
+    if (InterlockedIncrement(&g_InEngineLog) == 1 &&
+        TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
+        EmitEngineTraceRecord(Record);
+    }
+
+    status = (real != NULL) ? real(Record) : 0;
+    InterlockedDecrement(&g_InEngineLog);
+    return status;
+}
+
+static void
+ArmEngineLog(
+    _In_ const BYTE* base)
+{
+    const PVOID dispatcher = (PVOID)(base + RSI_ENGINE_DISPATCHER_RVA);
+    PVOID       instance = NULL;
+    PVOID       owner = NULL;
+    PVOID       previous;
+    BOOL        usable;
+    BYTE*       slot;
+    BYTE        abi = 0;
+    PVOID       current = NULL;
+
+    if (CopyTargetMemory(base + RSI_ENGINE_TRACE_ABI_RVA,
+                         &abi, sizeof(abi)) != sizeof(abi)) {
+        return;
+    }
+
+    usable = ReadTargetPointer(base + RSI_ENGINE_INSTANCE_RVA, &instance) &&
+             instance != NULL &&
+             ReadTargetPointer(instance, &owner) &&
+             owner == dispatcher;
+
+    /*
+     * Only act once the same instance has been observed twice in a row. That
+     * keeps a transient or freed instance (the engine was unloaded between the
+     * two reads) from being patched.
+     */
+    previous = g_LastEngineInstance;
+    g_LastEngineInstance = usable ? instance : NULL;
+    if (!usable || previous != instance) {
+        return;
+    }
+
+    slot = (BYTE*)instance + ((abi != 0) ? RSI_ENGINE_TRACE_FN_LEGACY
+                                         : RSI_ENGINE_TRACE_FN_NEW);
+    if (!ReadTargetPointer(slot, &current)) {
+        if (g_LastArmFailureInstance != instance) {
+            g_LastArmFailureInstance = instance;
+            DiagLog("engine trace slot unreadable: instance=%p slot=+0x%03X",
+                    instance, (unsigned)(slot - (BYTE*)instance));
+            EmitStatusErrorV(0, "engine log capture: cannot read trace slot "
+                                "instance=0x%p slot=+0x%03X abi=%u",
+                             instance, (unsigned)(slot - (BYTE*)instance),
+                             (unsigned)abi);
+        }
+        return;
+    }
+    if (current == (PVOID)Hook_EngineTrace) {
+        g_LastArmFailureInstance = NULL;
+        return;
+    }
+
+    /*
+     * The engine boots asynchronously: the slot is either still zero or
+     * already holds MpSvc's sink. Save whatever is there (NULL is fine) and
+     * take the slot over. An engine reboot or reload writes its own pointer
+     * again; the next poll re-installs this hook.
+     */
+    g_RealEngineTrace = (PFN_ENGINE_TRACE)current;
+    if (WriteTargetPointer(slot, (PVOID)Hook_EngineTrace)) {
+        g_LastArmFailureInstance = NULL;
+        DiagLog("engine trace slot armed: instance=%p slot=+0x%03X original=%p",
+                instance, (unsigned)(slot - (BYTE*)instance), current);
+        EmitStatusInfoV(0, "engine log capture armed: instance=0x%p "
+                        "slot=+0x%03X original=0x%p abi=%u",
+                        instance, (unsigned)(slot - (BYTE*)instance), current,
+                        (unsigned)abi);
+        InterlockedExchange(&g_EngineLogArmed, 1);
+    } else if (g_LastArmFailureInstance != instance) {
+        g_LastArmFailureInstance = instance;
+        DiagLog("engine trace slot write failed: instance=%p slot=+0x%03X",
+                instance, (unsigned)(slot - (BYTE*)instance));
+        EmitStatusErrorV(0, "engine log capture: cannot write trace slot "
+                            "instance=0x%p slot=+0x%03X",
+                         instance, (unsigned)(slot - (BYTE*)instance));
+    }
+}
+
+/*
+ * (Re)install the __rsignal detour. mpengine.dll is unloaded and reloaded by
+ * MpSvc (engine refresh/idle unload), which drops the inline patch and can
+ * even remap the module at a different base. The saved prologue is compared
+ * with the code now at the export: if it matches, the module is fresh again
+ * and the hook has to be re-attached.
+ */
+static BOOL
+TryInstallHook(
+    _In_ HMODULE Engine)
+{
+    PFN___rsignal target;
+    BYTE          prologue[sizeof(g_HookedPrologue)];
+    HANDLE        threadHandles[MAX_ENLISTED_THREADS];
+    DWORD         threadCount = 0;
+    LONG          error;
+
+    target = (PFN___rsignal)GetProcAddress(Engine, MPENGINE_HOOK_EXPORT);
+    if (target == NULL ||
+        CopyTargetMemory((const void*)target, prologue, sizeof(prologue)) !=
+            sizeof(prologue)) {
+        return FALSE;
+    }
+
+    if (g_HookedPrologueValid && g_HookedTarget == (PVOID)target &&
+        memcmp(prologue, g_HookedPrologue, sizeof(prologue)) != 0) {
+        return TRUE;                 /* our trampoline is still in place */
+    }
+
+    /*
+     * A failed install (ACG re-enabled, code pages protected) is retried, but
+     * slowly: every attempt suspends the whole process to enlist its threads.
+     */
+    if (g_NextInstallAttempt != 0 && GetTickCount64() < g_NextInstallAttempt) {
+        return FALSE;
+    }
+
+    memcpy(g_HookedPrologue, prologue, sizeof(g_HookedPrologue));
+    g_HookedPrologueValid = TRUE;
+    g_HookedTarget = (PVOID)target;
+    g_Real__rsignal = target;
+
+    error = DetourTransactionBegin();
+    if (error != NO_ERROR) {
+        DiagLog("re-hook: DetourTransactionBegin = %ld", (long)error);
+        g_NextInstallAttempt = GetTickCount64() + RSI_HOOK_RETRY_MS;
+        return FALSE;
+    }
+    threadCount = EnlistProcessThreads(threadHandles, MAX_ENLISTED_THREADS);
+    error = DetourAttach((PVOID*)&g_Real__rsignal, (PVOID)Hook___rsignal);
+    if (error == NO_ERROR) {
+        error = DetourTransactionCommit();
+    } else {
+        (void)DetourTransactionAbort();
+    }
+    ReleaseThreadHandles(threadHandles, threadCount);
+
+    DiagLog("hook install @ %p -> %ld", (void*)target, (long)error);
+    if (error != NO_ERROR) {
+        g_NextInstallAttempt = GetTickCount64() + RSI_HOOK_RETRY_MS;
+        EmitStatusErrorV((ULONG)error, "re-hook %s!%s failed: %ld",
+                         MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT, (long)error);
+        return FALSE;
+    }
+    g_NextInstallAttempt = 0;
+
+    EmitStatusInfoV(0, "Detours hook installed: %s!%s -> 0x%p",
+                    MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
+                    (void*)Hook___rsignal);
+    return TRUE;
+}
+
+/*
+ * Keeps the hooks alive for the life of the process. The engine mapping and
+ * its instance object can be replaced at any time, so both are resolved from
+ * the current module every poll instead of being cached at injection time.
+ */
+static DWORD WINAPI
+HookMaintenanceThread(
+    _In_ LPVOID Parameter)
+{
+    (void)Parameter;
+
+    for (;;) {
+        HMODULE engine = GetModuleHandleW(MPENGINE_DLL_WNAME);
+
+        if (engine != NULL) {
+            (void)TryInstallHook(engine);
+            ArmEngineLog((const BYTE*)engine);
+        }
+
+        Sleep(RSI_ENGINE_LOG_POLL_MS);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Hook                                                                      */
 /* ------------------------------------------------------------------------- */
 
@@ -1004,7 +1738,6 @@ WaitForModule(
  * transaction; the commit (or abort) resumes it. The caller must therefore
  * keep these handles open until the transaction has finished.
  */
-#define MAX_ENLISTED_THREADS 4096
 
 static DWORD
 EnlistProcessThreads(
@@ -1083,18 +1816,25 @@ InstallHooksThread(
 {
     HMODULE engine;
     LONG    error;
+    HRESULT registered;
+    PVOID   target;
+    BYTE    prologue[sizeof(g_HookedPrologue)];
     char    host[MAX_PATH] = { 0 };
     HANDLE  threadHandles[MAX_ENLISTED_THREADS];
     DWORD   threadCount = 0;
 
     (void)Parameter;
 
+    DiagLog("install thread start");
+
     /*
      * Register before anything else so that even early failures are visible
      * to the listener. TraceLoggingRegister must not be called from DllMain;
      * this worker thread makes it safe.
      */
-    if (SUCCEEDED(TraceLoggingRegister(g_hRSignalProvider))) {
+    registered = TraceLoggingRegister(g_hRSignalProvider);
+    DiagLog("TraceLoggingRegister hr=0x%08lX", (unsigned long)registered);
+    if (SUCCEEDED(registered)) {
         InterlockedExchange(&g_ProviderRegistered, 1);
     }
 
@@ -1108,8 +1848,10 @@ InstallHooksThread(
     (void)GetModuleFileNameA(NULL, host, sizeof(host));
     EmitStatusInfoV(0, "payload attached: pid=%lu host=%s",
                     (unsigned long)GetCurrentProcessId(), host);
+    DiagLog("payload attached, waiting for %s", MPENGINE_DLL_NAME);
 
     engine = WaitForModule(MPENGINE_DLL_WNAME, MPENGINE_MODULE_WAIT_MS);
+    DiagLog("%s = %p", MPENGINE_DLL_NAME, (void*)engine);
     if (engine == NULL) {
         EmitStatusErrorV(0, "%s is not loaded after %lu ms; no hook installed",
                          MPENGINE_DLL_NAME,
@@ -1120,6 +1862,8 @@ InstallHooksThread(
 
     g_Real__rsignal = (PFN___rsignal)
         GetProcAddress(engine, MPENGINE_HOOK_EXPORT);
+    DiagLog("GetProcAddress(%s) = %p (err=%lu)", MPENGINE_HOOK_EXPORT,
+            (void*)g_Real__rsignal, (unsigned long)GetLastError());
     if (g_Real__rsignal == NULL) {
         EmitStatusErrorV(GetLastError(), "export %s!%s not found",
                          MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT);
@@ -1129,16 +1873,27 @@ InstallHooksThread(
                     MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
                     (void*)g_Real__rsignal);
 
+    /*
+     * Remember the pristine prologue before Detours overwrites it. The
+     * maintenance thread compares it with the code at the export to detect a
+     * module reload (the engine remaps itself when it is refreshed).
+     */
+    target = (PVOID)g_Real__rsignal;
+    (void)CopyTargetMemory(target, prologue, sizeof(prologue));
+
     error = DetourTransactionBegin();
+    DiagLog("DetourTransactionBegin = %ld", (long)error);
     if (error != NO_ERROR) {
         EmitStatusErrorV((ULONG)error, "DetourTransactionBegin failed");
         return 0;
     }
 
     threadCount = EnlistProcessThreads(threadHandles, MAX_ENLISTED_THREADS);
+    DiagLog("enlisted %lu threads", (unsigned long)threadCount);
 
     error = DetourAttach((PVOID*)&g_Real__rsignal,
                          (PVOID)Hook___rsignal);
+    DiagLog("DetourAttach = %ld", (long)error);
     if (error != NO_ERROR) {
         EmitStatusErrorV((ULONG)error, "DetourAttach(%s) failed",
                          MPENGINE_HOOK_EXPORT);
@@ -1148,6 +1903,8 @@ InstallHooksThread(
     }
 
     error = DetourTransactionCommit();
+    DiagLog("DetourTransactionCommit = %ld (Win32 %lu)", (long)error,
+            (unsigned long)GetLastError());
     ReleaseThreadHandles(threadHandles, threadCount);
     if (error != NO_ERROR) {
         ULONG lastError = GetLastError();
@@ -1168,6 +1925,27 @@ InstallHooksThread(
     EmitStatusInfoV(0, "Detours hook installed: %s!%s -> 0x%p",
                     MPENGINE_DLL_NAME, MPENGINE_HOOK_EXPORT,
                     (void*)Hook___rsignal);
+    memcpy(g_HookedPrologue, prologue, sizeof(g_HookedPrologue));
+    g_HookedPrologueValid = TRUE;
+    g_HookedTarget = target;
+
+    /*
+     * The engine mapping and its instance object can be replaced at any time
+     * (engine refresh / idle unload). One thread keeps both hooks installed
+     * and also arms the engine log slot once the instance exists.
+     */
+    {
+        HANDLE maintenance = CreateThread(NULL, 0, HookMaintenanceThread,
+                                          NULL, 0, NULL);
+
+        if (maintenance != NULL) {
+            CloseHandle(maintenance);
+        } else {
+            EmitStatusErrorV(GetLastError(),
+                             "hook maintenance thread could not be created");
+        }
+    }
+
     return 0;
 }
 
@@ -1187,6 +1965,8 @@ DllMain(
         HANDLE thread;
 
         DisableThreadLibraryCalls(Instance);
+        DiagLog("DllMain attach pid=%lu",
+                (unsigned long)GetCurrentProcessId());
 
         /*
          * Do not call Detours or TraceLoggingRegister from DllMain. The
@@ -1195,7 +1975,11 @@ DllMain(
          */
         thread = CreateThread(NULL, 0, InstallHooksThread, NULL, 0, NULL);
         if (thread != NULL) {
+            DiagLog("worker thread %p created", (void*)thread);
             CloseHandle(thread);
+        } else {
+            DiagLog("CreateThread failed err=%lu",
+                    (unsigned long)GetLastError());
         }
         break;
     }
