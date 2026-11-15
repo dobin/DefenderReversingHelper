@@ -100,17 +100,33 @@ Record layout (mpengine 1.1.26100.4 — re-check the RVAs per engine build):
 `kind 0x19` (text log) is emitted as an `EngineLog` event. The structured
 records are emitted as `EngineTrace` events:
 
-- `kind 0x28` is a deferred scan request. The payload decodes the work item
+- `kind 0x28` is a host work item. The payload decodes the work item
   (`opcode`, `flags`, `kind`, `target`, `version`, `id`) so the listener can
   print e.g. `engine scan request : kind=ems target=pid:8172 id=0x8E
-  opcode=0x22 version=1 flags=0x1`. This is the engine's own "scan this
-  process" decision and is emitted regardless of the other-kinds switch.
-- `kind 0x18`/`0x1C`/`0x1E`/`0x20`/`0x46`/`0x4C`/`0x62` (engine telemetry)
-  attach a bounded hex copy of the record payload
-  (`RSI_ENGINE_TRACE_DUMP_BYTES`, default 256) so the fields can be decoded
-  offline without rebuilding the payload. `RSI_ENGINE_CAPTURE_OTHER_KINDS=1`
-  (the default) enables this; set it to `0` to emit only the text log and
-  scan requests.
+  opcode=0x22 version=1 flags=0x1`. Opcode `0x22` is the engine's own "scan
+  this process" decision; other opcodes are other host tasks.
+- `kind 0x18` is the generic telemetry event (`{u64 type; void *data}`). The
+  hook decodes the common `data` shape (`name`/`value`) and prints an
+  `engine event` line.
+- `kind 0x38` (rich) and `kind 0x1C` (legacy) are MOAC/cloud lookup records.
+  The hook decodes the lookup id, file id, flags and name pointer/length.
+- `kind 0x25` is a scan stage message: the payload points at the
+  `wchar_t *` line the scan pipeline formatted, e.g.
+  `engine scan stage : STOP:Engine quick scan variant, type 0x10050000,
+  source=6`.
+- `kind 0x22`/`0x23` are the host data channel (`len`, `buffer`, `value`);
+  `0x2A` notifications, `0x1A`/`0x37` MOAC entry serializations, `0x3D`/`0x3E`
+  host-config query/release, `0x44` RTP monitoring updates and `0x52`
+  remediation configuration are decoded into named fields as well.
+- Other kinds (`0x1E`/`0x20`/`0x3F`/`0x43`/`0x46`/`0x4C`/`0x62`, ...) attach a
+  bounded hex copy of the record payload (`RSI_ENGINE_TRACE_DUMP_BYTES`,
+  default 256) so the fields can be decoded offline without rebuilding the
+  payload. `RSI_ENGINE_CAPTURE_OTHER_KINDS=1` (the default) enables this; set
+  it to `0` to emit only the decoded kinds and text log.
+
+Every `EngineTrace` event carries `CallerRva`, the return address inside
+`mpengine.dll` that emitted the record. It maps a new kind to its emitter in
+Ghidra; see [`docs/engine_trace_kinds.md`](../../docs/engine_trace_kinds.md).
 
 Caveats:
 

@@ -52,21 +52,54 @@ The payload also forwards the engine's structured trace records. A deferred
 scan request (`kind 0x28`) is decoded into the same line mpclient prints:
 
 ```text
-[2026-11-15 23:52:35.020] pid=5680 tid=3692 engine scan request : kind=ems target=pid:8172 id=0x8E opcode=0x22 version=1 flags=0x1
+[2026-11-15 23:52:35.020] pid=5680 tid=3692 engine scan request : kind=ems target=ppids:{{8244, ...}} id=0x8E opcode=0x22 version=0 flags=0x1 caller=+0x9F9F01
 ```
 
-Other kinds (`0x18`/`0x1C`/`0x1E`/`0x20`/`0x46`/`0x4C`/`0x62` engine
-telemetry) print their kind and a bounded payload copy:
+`kind 0x18` is a generic host telemetry event (for example
+`processmemoryscan`):
 
 ```text
-[2026-11-15 23:52:35.020] pid=5680 tid=3692 engine trace : kind=0x1C (engine telemetry) payload=64 byte(s) hex=...
+... engine event : type=0x1 name=processmemoryscan value=pid:8172,ProcessStart:... version=0 id=0x87 detail=- caller=+0x4A73A6
 ```
 
-Add `--dump` to get the full hex+ASCII dump of the captured payload; the
-payload capture is bounded by `RSI_ENGINE_TRACE_DUMP_BYTES` in the DLL
-(default 256). Use `--quiet-trace` to hide these records. In `jsonl` format
-they are `{"k":"trace","kind":"0x28","kind_name":"ems","target":"pid:8172",
-"opcode":34,...}` objects; telemetry records carry `payload_hex`.
+`kind 0x38` and `kind 0x1C` are MOAC/cloud lookup records:
+
+```text
+... engine trace : kind=0x38 (moac lookup) caller=+0x295D96 detail=lookup=1A1D3D03-4302-40DF-8994-5F47D4D178D0 fileid=... id=0xF48F6190 flag=1
+```
+
+`kind 0x25` carries the scan-stage message the engine formatted:
+
+```text
+... engine scan stage : STOP:Engine quick scan variant, type 0x10050000, source=6 caller=+0x7746CC
+```
+
+The small fixed-layout records decode into named fields as well:
+
+```text
+... engine trace : kind=0x22 (host data read) caller=+0x2886A7 detail=len=8 buffer=0x15E3A5FBCB0 value=0x10
+... engine trace : kind=0x2A (notification) caller=+0x3D5653 detail=type=6 object=0x1C6DD1C5940 [2]=0x0 [3]=0x0 [4]=0x2 [5]=0x0
+... engine trace : kind=0x3D (host config query) caller=+0x4873AC detail=version=0x101 [1]=0x0 [2]=0x0 [3]=0x0
+... engine trace : kind=0x44 (rtp update) caller=+0x348EFD detail=type=20 [1]=...
+... engine trace : kind=0x52 (remediation config) caller=+0x953737 detail=delay=0 maxdelay=0 disable=0 opt1=0 opt2=0 opt4=0 opt5=0
+```
+
+Other kinds print their kind, caller RVA and a bounded payload copy:
+
+```text
+... engine trace : kind=0x3F (engine record) caller=+0x7A16FB payload=256 byte(s) hex=...
+```
+
+`caller` is the return address inside `mpengine.dll` that emitted the record;
+use it to map a new kind to its function in Ghidra.  Add `--dump` to get the
+full hex+ASCII dump of the captured payload; the payload capture is bounded by
+`RSI_ENGINE_TRACE_DUMP_BYTES` in the DLL (default 256). Use `--quiet-trace` to
+hide these records. In `jsonl` format they are
+`{"k":"trace","kind":"0x28","caller_rva":...,"kind_name":"ems",
+"target":"pid:8172",...}` objects; telemetry records carry `payload_hex`.
+
+See [`docs/engine_trace_kinds.md`](../../docs/engine_trace_kinds.md) for the
+recovered record layouts and the per-kind meaning.
 
 Engine log lines are event-driven: the engine only emits them on boot (ASR rule
 load), on a detection, or when its diagnostics are requested. To force a burst

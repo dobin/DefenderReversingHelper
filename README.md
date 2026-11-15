@@ -22,8 +22,9 @@ scan requests and telemetry) through the engine-instance trace callback.
 another process. Detours is compiled from its source checkout
 (`C:\Repos\Detours` by default). Use `--allow-dynamic-code` in addition to
 `--ppl` when the target has ACG. See
-[dll_injector/detours_payload](dll_injector/detours_payload/README.md) and
-[tools/etw_listener](tools/etw_listener/README.md).
+[dll_injector/detours_payload](dll_injector/detours_payload/README.md),
+[tools/etw_listener](tools/etw_listener/README.md) and the recovered
+[trace-record layouts](docs/engine_trace_kinds.md).
 
 The purpose is to enable AI agents to start tools as PPL. 
 

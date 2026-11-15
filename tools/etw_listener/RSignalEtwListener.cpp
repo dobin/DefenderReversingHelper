@@ -515,11 +515,39 @@ EngineTraceKindLabel(
     case 0x19:
         return "text log";
     case 0x28:
-        return "host work item (scan request)";
+        return "host work item";
     case 0x0B:
         return "host event";
+    case 0x13:
+    case 0x15:
+        return "engine notification";
     case 0x18:
+        return "host event (telemetry)";
+    case 0x1A:
+    case 0x37:
+        return "moac entry";
     case 0x1C:
+        return "moac lookup (legacy)";
+    case 0x1F:
+        return "moac v2 attempt";
+    case 0x22:
+        return "host data read";
+    case 0x23:
+        return "host data write";
+    case 0x25:
+        return "scan stage";
+    case 0x2A:
+        return "notification";
+    case 0x38:
+        return "moac lookup";
+    case 0x3D:
+        return "host config query";
+    case 0x3E:
+        return "host config release";
+    case 0x44:
+        return "rtp update";
+    case 0x52:
+        return "remediation config";
     case 0x1E:
     case 0x20:
     case 0x46:
@@ -549,9 +577,11 @@ HandleEngineTraceEvent(
     uint32_t    version = 0;
     uint32_t    id = 0;
     uint32_t    payloadLength = 0;
+    uint64_t    callerRva = 0;
     uint64_t    engineTime = 0;
     std::string kindName;
     std::string target;
+    std::string detail;
     std::string payloadHex;
 
     if (!g_options.showEngineTrace) {
@@ -560,6 +590,7 @@ HandleEngineTraceEvent(
 
     Parser.try_parse(L"SeqNum", sequence);
     Parser.try_parse(L"Kind", kind);
+    Parser.try_parse(L"CallerRva", callerRva);
     Parser.try_parse(L"EngineTime", engineTime);
     Parser.try_parse(L"Opcode", opcode);
     Parser.try_parse(L"Flags", flags);
@@ -568,6 +599,7 @@ HandleEngineTraceEvent(
     Parser.try_parse(L"PayloadLength", payloadLength);
     (void)Parser.try_parse(L"KindName", kindName);
     (void)Parser.try_parse(L"Target", target);
+    (void)Parser.try_parse(L"Detail", detail);
     (void)Parser.try_parse(L"PayloadHex", payloadHex);
 
     std::vector<BYTE> payload;
@@ -578,17 +610,20 @@ HandleEngineTraceEvent(
     if (g_options.jsonlFormat) {
         PrintJson(Format("{\"k\":\"trace\",\"seq\":%lu,\"ts\":%llu,"
                          "\"pid\":%lu,\"tid\":%lu,\"kind\":\"0x%X\","
-                         "\"kind_name\":\"%s\",\"target\":\"%s\","
-                         "\"opcode\":%lu,\"flags\":%lu,\"version\":%lu,"
-                         "\"id\":%lu,\"payload_len\":%lu,"
+                         "\"caller_rva\":%llu,\"kind_name\":\"%s\","
+                         "\"target\":\"%s\",\"detail\":\"%s\","
+                         "\"opcode\":%lu,\"flags\":%lu,"
+                         "\"version\":%lu,\"id\":%lu,\"payload_len\":%lu,"
                          "\"payload_hex\":\"%s\",\"engine_time\":%llu}\n",
                          (unsigned long)sequence,
                          (unsigned long long)WallClockTimestamp(Record),
                          (unsigned long)Record.EventHeader.ProcessId,
                          (unsigned long)Record.EventHeader.ThreadId,
                          (unsigned int)kind,
+                         (unsigned long long)callerRva,
                          JsonEscape(kindName).c_str(),
                          JsonEscape(target).c_str(),
+                         JsonEscape(detail).c_str(),
                          (unsigned long)opcode,
                          (unsigned long)flags,
                          (unsigned long)version,
@@ -599,28 +634,66 @@ HandleEngineTraceEvent(
         return;
     }
 
-    if (kind == 0x28) {
-        Print(Format("%s engine scan request : kind=%s target=%s id=0x%02lX "
-                     "opcode=0x%02lX version=%lu flags=0x%lX\n",
+    if (kind == 0x18) {
+        Print(Format("%s engine event : type=0x%lX name=%s value=%s "
+                     "version=%lu id=0x%02lX detail=%s caller=+0x%llX\n",
                      Prefix.c_str(),
+                     (unsigned long)opcode,
                      kindName.empty() ? "?" : kindName.c_str(),
                      target.empty() ? "?" : target.c_str(),
-                     (unsigned long)id,
-                     (unsigned long)opcode,
                      (unsigned long)version,
-                     (unsigned long)flags));
+                     (unsigned long)id,
+                     detail.empty() ? "-" : detail.c_str(),
+                     (unsigned long long)callerRva));
         return;
     }
 
-    std::string text = Format("%s engine trace : kind=0x%X (%s)",
+    if (kind == 0x28) {
+        if (opcode == 0x22) {
+            Print(Format("%s engine scan request : kind=%s target=%s "
+                         "id=0x%02lX opcode=0x22 version=%lu flags=0x%lX "
+                         "caller=+0x%llX\n",
+                         Prefix.c_str(),
+                         kindName.empty() ? "?" : kindName.c_str(),
+                         target.empty() ? "?" : target.c_str(),
+                         (unsigned long)id,
+                         (unsigned long)version,
+                         (unsigned long)flags,
+                         (unsigned long long)callerRva));
+        } else {
+            Print(Format("%s engine work item : opcode=0x%lX flags=0x%lX "
+                         "caller=+0x%llX\n",
+                         Prefix.c_str(),
+                         (unsigned long)opcode,
+                         (unsigned long)flags,
+                         (unsigned long long)callerRva));
+        }
+        return;
+    }
+
+    if (kind == 0x25) {
+        Print(Format("%s engine scan stage : %s caller=+0x%llX\n",
+                     Prefix.c_str(),
+                     target.empty() ? "?" : target.c_str(),
+                     (unsigned long long)callerRva));
+        return;
+    }
+
+    std::string text = Format("%s engine trace : kind=0x%X (%s) caller=+0x%llX",
                               Prefix.c_str(),
                               (unsigned int)kind,
-                              EngineTraceKindLabel(kind));
+                              EngineTraceKindLabel(kind),
+                              (unsigned long long)callerRva);
 
-    if (!kindName.empty() || !target.empty()) {
+    if (!kindName.empty() && !target.empty()) {
         text += Format(" kind_name=%s target=%s",
-                       kindName.empty() ? "?" : kindName.c_str(),
-                       target.empty() ? "?" : target.c_str());
+                       kindName.c_str(),
+                       target.c_str());
+    } else if (!target.empty()) {
+        text += Format(" target=%s", target.c_str());
+    }
+    if (!detail.empty()) {
+        text += Format(" detail=%s", detail.c_str());
     }
 
     size_t shownBytes = payload.empty() ? payloadLength : payload.size();

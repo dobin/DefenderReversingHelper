@@ -63,6 +63,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <intrin.h>
 #include <evntrace.h>
 #include <TraceLoggingProvider.h>
 
@@ -1051,8 +1052,37 @@ EmitReturn(
 #define RSI_ENGINE_LOG_LENGTH       0x10u
 #define RSI_ENGINE_LOG_MESSAGE      0x18u
 
-#define RSI_ENGINE_KIND_LOG         0x19u
-#define RSI_ENGINE_KIND_WORK        0x28u
+/*
+ * Trace record kinds.  Every kind below was mapped to its mpengine emitter
+ * through the CallerRva carried in the EngineTrace event (engine build
+ * 1.1.26100.4, sha256 be18e430...e1dbff); see docs/engine_trace_kinds.md.
+ */
+#define RSI_ENGINE_KIND_NOTIFY       0x13u  /* forwarded notification         */
+#define RSI_ENGINE_KIND_NOTIFY_ALT   0x15u  /* forwarded notification (alt)   */
+#define RSI_ENGINE_KIND_EVENT        0x18u  /* generic telemetry event        */
+#define RSI_ENGINE_KIND_LOG          0x19u  /* Engine: text log               */
+#define RSI_ENGINE_KIND_MOAC_ENTRY   0x1Au  /* MOAC entry, 0x50-byte form     */
+#define RSI_ENGINE_KIND_MOAC_LEGACY  0x1Cu  /* MOAC lookup, legacy form       */
+#define RSI_ENGINE_KIND_MOAC_V2      0x1Fu  /* MOAC v2 attempt result         */
+#define RSI_ENGINE_KIND_HOST_READ    0x22u  /* host data read                 */
+#define RSI_ENGINE_KIND_HOST_WRITE   0x23u  /* host data write                */
+#define RSI_ENGINE_KIND_SCAN_STAGE   0x25u  /* scan stage message             */
+#define RSI_ENGINE_KIND_WORK         0x28u  /* host work item                 */
+#define RSI_ENGINE_KIND_NOTIFICATION 0x2Au  /* notification record, type 6    */
+#define RSI_ENGINE_KIND_MOAC_ENTRY_R 0x37u  /* MOAC entry, 0x40-byte form     */
+#define RSI_ENGINE_KIND_MOAC         0x38u  /* MOAC lookup, rich form         */
+#define RSI_ENGINE_KIND_HOST_CONFIG  0x3Du  /* host config query (out-buffer) */
+#define RSI_ENGINE_KIND_HOST_RELEASE 0x3Eu  /* host config buffer released    */
+#define RSI_ENGINE_KIND_RTP_UPDATE   0x44u  /* RTP/iClientInfo state update   */
+#define RSI_ENGINE_KIND_REMEDIATION  0x52u  /* remediation configuration      */
+
+/*
+ * Kind 0x18 is the generic host telemetry event: the payload starts with a
+ * u64 type (1 in every observed emitter) and a pointer to a type-specific
+ * structure.  For the EMS scan-report emitter the structure is the scan
+ * request args { wchar_t *kind; wchar_t *target; u16 version; u16 id; ... }.
+ */
+#define RSI_ENGINE_EVENT_PAYLOAD_DATA 0x08u
 
 /*
  * Kind 0x28 is a host work item.  The engine builds it for a deferred scan and
@@ -1093,6 +1123,9 @@ EmitReturn(
 #ifndef RSI_ENGINE_WORK_TARGET_CHARS
 #define RSI_ENGINE_WORK_TARGET_CHARS 256
 #endif
+#ifndef RSI_ENGINE_DETAIL_CHARS
+#define RSI_ENGINE_DETAIL_CHARS 256
+#endif
 
 /* Bounded payload copy attached to unknown/telemetry trace records. */
 #ifndef RSI_ENGINE_TRACE_DUMP_BYTES
@@ -1111,6 +1144,7 @@ typedef LONG (WINAPI *PFN_ENGINE_TRACE)(const void* Record);
 static PFN_ENGINE_TRACE g_RealEngineTrace = NULL;
 static PVOID g_LastEngineInstance = NULL;
 static PVOID g_LastArmFailureInstance = NULL;
+static PVOID g_EngineModuleBase = NULL;
 static volatile LONG g_EngineLogArmed = 0;
 static volatile LONG g_EngineLogCalls = 0;
 static volatile LONG g_EngineTraceCalls = 0;
@@ -1285,14 +1319,174 @@ WideToUtf8(
     }
 }
 
+static void
+FormatGuidText(
+    _In_reads_bytes_(16) const BYTE* Bytes,
+    _Out_writes_z_(Chars) wchar_t* Text,
+    _In_ SIZE_T Chars)
+{
+    (void)_snwprintf_s(Text, Chars, _TRUNCATE,
+                       L"%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                       ((unsigned)Bytes[0] | ((unsigned)Bytes[1] << 8) |
+                        ((unsigned)Bytes[2] << 16) |
+                        ((unsigned)Bytes[3] << 24)),
+                       ((unsigned)Bytes[4] | ((unsigned)Bytes[5] << 8)),
+                       ((unsigned)Bytes[6] | ((unsigned)Bytes[7] << 8)),
+                       (unsigned)Bytes[8], (unsigned)Bytes[9],
+                       (unsigned)Bytes[10], (unsigned)Bytes[11],
+                       (unsigned)Bytes[12], (unsigned)Bytes[13],
+                       (unsigned)Bytes[14], (unsigned)Bytes[15]);
+}
+
 /*
- * Structured trace record.  Kind 0x28 is decoded; other kinds carry a bounded
- * hex copy of the payload so they can be decoded offline without another
- * payload build.
+ * Render the qwords at Payload+Offset as "[<slot>]=0x<value> ..." so the common
+ * record shape (a small engine structure with 8-byte fields) stays readable
+ * without a dedicated decoder.  Slot numbers are byte offsets / 8.
+ */
+static void
+FormatQwordFields(
+    _In_reads_bytes_opt_(Count * sizeof(UINT64)) const BYTE* Payload,
+    _In_ UINT32 Offset,
+    _In_ UINT32 Count,
+    _Out_writes_z_(Chars) wchar_t* Text,
+    _In_ SIZE_T Chars)
+{
+    SIZE_T used = 0;
+    UINT32 index;
+
+    if (Text == NULL || Chars == 0) {
+        return;
+    }
+    Text[0] = L'\0';
+    if (Payload == NULL) {
+        return;
+    }
+
+    for (index = 0; index < Count; index++) {
+        UINT64 value = 0;
+        int    written;
+
+        if (CopyTargetMemory(Payload + Offset + index * sizeof(UINT64),
+                             &value, sizeof(value)) != sizeof(value)) {
+            break;
+        }
+        written = _snwprintf_s(Text + used, Chars - used, _TRUNCATE,
+                               (index == 0) ? L"[%u]=0x%llX" : L" [%u]=0x%llX",
+                               (unsigned)((Offset / 8) + index),
+                               (unsigned long long)value);
+        if (written <= 0) {
+            break;
+        }
+        used += (SIZE_T)written;
+        if (used + 32 >= Chars) {
+            break;
+        }
+    }
+}
+
+/*
+ * Kind 0x25 payload points at the wchar_t* stage message built by the scan
+ * pipeline (for example L"START:Engine quick scan variant, type 0x..."), so
+ * dereference it once.  Fall back to treating the payload itself as text when
+ * the pointer is not readable.
+ */
+static void
+ReadStageText(
+    _In_ const void* Payload,
+    _Out_writes_z_(Chars) wchar_t* Text,
+    _In_ SIZE_T Chars)
+{
+    PVOID   text = NULL;
+    wchar_t probe = L'\0';
+
+    Text[0] = L'\0';
+    if (Payload == NULL) {
+        return;
+    }
+
+    if (ReadTargetPointer(Payload, &text) &&
+        text != NULL &&
+        CopyTargetMemory(text, &probe, sizeof(probe)) == sizeof(probe) &&
+        probe >= L' ') {
+        (void)CopyWideString(Text, Chars, (const wchar_t*)text, 0);
+        if (Text[0] != L'\0') {
+            return;
+        }
+    }
+
+    (void)CopyWideString(Text, Chars, (const wchar_t*)Payload, 0);
+}
+
+/*
+ * Accept a decoded name only when it looks like text.  The engine's name field
+ * is often an empty/absent inline buffer, and misreading it as a string would
+ * otherwise print control characters.
+ */
+static BOOL
+TextLooksPrintable(
+    _In_z_ const wchar_t* Text)
+{
+    SIZE_T length = wcslen(Text);
+    SIZE_T printable = 0;
+    SIZE_T i;
+
+    for (i = 0; i < length; i++) {
+        if (Text[i] >= L' ' && Text[i] < 0x7F) {
+            printable++;
+        }
+    }
+    return length != 0 && printable != 0 && printable * 2 >= length;
+}
+
+/*
+ * The MOAC rich record carries an engine-owned name buffer plus the buffer
+ * length in bytes.  Try UTF-16 first and fall back to ANSI so an unknown
+ * encoding does not silently print "?".
+ */
+static void
+ReadNameAuto(
+    _In_opt_ const void* Source,
+    _In_opt_ UINT64 KnownBytes,
+    _Out_writes_z_(Chars) wchar_t* Text,
+    _In_ SIZE_T Chars)
+{
+    char   ansi[RSI_ENGINE_WORK_TARGET_CHARS];
+    SIZE_T length;
+
+    Text[0] = L'\0';
+    if (Source == NULL || KnownBytes == 0) {
+        return;
+    }
+
+    (void)CopyWideString(Text, Chars, (const wchar_t*)Source, KnownBytes);
+    if (TextLooksPrintable(Text)) {
+        return;
+    }
+
+    Text[0] = L'\0';
+    length = (KnownBytes < sizeof(ansi) - 1) ? (SIZE_T)KnownBytes
+                                             : sizeof(ansi) - 1;
+    length = CopyTargetMemory(Source, ansi, length);
+    if (length == 0) {
+        return;
+    }
+    ansi[length] = '\0';
+    if (MultiByteToWideChar(CP_ACP, 0, ansi, -1, Text, (int)Chars) <= 0 ||
+        !TextLooksPrintable(Text)) {
+        Text[0] = L'\0';
+    }
+}
+
+/*
+ * Structured trace record.  Kinds 0x18/0x1C/0x28/0x38 are fully decoded and
+ * the small fixed-layout records (0x13/0x15/0x1A/0x1F/0x22/0x23/0x25/0x2A/
+ * 0x37/0x3D/0x3E/0x44/0x52) are decoded into named fields; anything else
+ * carries a bounded hex copy of the payload for offline decoding.
  */
 static void
 EmitEngineTrace(
     _In_ UINT32 Kind,
+    _In_ UINT64 CallerRva,
     _In_ UINT64 EngineTime,
     _In_ UINT32 Opcode,
     _In_ UINT32 Flags,
@@ -1300,11 +1494,13 @@ EmitEngineTrace(
     _In_ UINT32 Id,
     _In_opt_ const wchar_t* KindName,
     _In_opt_ const wchar_t* Target,
+    _In_opt_ const wchar_t* Detail,
     _In_reads_bytes_opt_(PayloadLength) const BYTE* Payload,
     _In_ SIZE_T PayloadLength)
 {
     char kindNameUtf8[RSI_ENGINE_WORK_KIND_CHARS * 3 + 1];
     char targetUtf8[RSI_ENGINE_WORK_TARGET_CHARS * 3 + 1];
+    char detailUtf8[RSI_ENGINE_DETAIL_CHARS * 3 + 1];
     char payloadHex[RSI_ENGINE_TRACE_DUMP_BYTES * 2 + 1];
 
     if (!g_ProviderRegistered) {
@@ -1313,6 +1509,7 @@ EmitEngineTrace(
 
     WideToUtf8(KindName, kindNameUtf8, sizeof(kindNameUtf8));
     WideToUtf8(Target, targetUtf8, sizeof(targetUtf8));
+    WideToUtf8(Detail, detailUtf8, sizeof(detailUtf8));
     payloadHex[0] = '\0';
 
     if (Payload != NULL && PayloadLength != 0) {
@@ -1332,6 +1529,7 @@ EmitEngineTrace(
         TraceLoggingUInt32((UINT32)InterlockedIncrement(&g_EngineTraceCalls),
                            "SeqNum"),
         TraceLoggingUInt32(Kind, "Kind"),
+        TraceLoggingUInt64(CallerRva, "CallerRva"),
         TraceLoggingUInt64(EngineTime, "EngineTime"),
         TraceLoggingUInt32(Opcode, "Opcode"),
         TraceLoggingUInt32(Flags, "Flags"),
@@ -1339,22 +1537,37 @@ EmitEngineTrace(
         TraceLoggingUInt32(Id, "Id"),
         TraceLoggingString(kindNameUtf8, "KindName"),
         TraceLoggingString(targetUtf8, "Target"),
+        TraceLoggingString(detailUtf8, "Detail"),
         TraceLoggingUInt32((UINT32)PayloadLength, "PayloadLength"),
         TraceLoggingString(payloadHex, "PayloadHex"));
 }
 
 static void
 EmitEngineTraceRecord(
-    _In_ const void* Record)
+    _In_ const void* Record,
+    _In_ const void* Caller)
 {
     const BYTE* record = (const BYTE*)Record;
     UINT64      kind = 0;
     UINT64      engineTime = 0;
+    UINT64      callerRva = 0;
     PVOID       payload = NULL;
 
     if (Record == NULL ||
         CopyTargetMemory(record, &kind, sizeof(kind)) != sizeof(kind)) {
         return;
+    }
+
+    if (Caller != NULL) {
+        const ULONG_PTR caller = (ULONG_PTR)Caller;
+
+        if (g_EngineModuleBase != NULL &&
+            caller >= (ULONG_PTR)g_EngineModuleBase &&
+            caller - (ULONG_PTR)g_EngineModuleBase < 0x2000000) {
+            callerRva = (UINT64)(caller - (ULONG_PTR)g_EngineModuleBase);
+        } else {
+            callerRva = (UINT64)caller;
+        }
     }
 
     (void)CopyTargetMemory(record + RSI_ENGINE_RECORD_TIME,
@@ -1399,6 +1612,137 @@ EmitEngineTraceRecord(
         return;
     }
 
+    if (kind == RSI_ENGINE_KIND_EVENT) {
+        UINT64  eventType = 0;
+        PVOID   data = NULL;
+        PVOID   namePtr = NULL;
+        PVOID   valuePtr = NULL;
+        UINT16  version = 0;
+        UINT16  id = 0;
+        wchar_t nameText[RSI_ENGINE_WORK_KIND_CHARS];
+        wchar_t valueText[RSI_ENGINE_WORK_TARGET_CHARS];
+
+        nameText[0] = L'\0';
+        valueText[0] = L'\0';
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory(payload, &eventType, sizeof(eventType));
+            if (ReadTargetPointer((const BYTE*)payload +
+                                      RSI_ENGINE_EVENT_PAYLOAD_DATA,
+                                  &data) &&
+                data != NULL) {
+                (void)ReadTargetPointer((const BYTE*)data + 0x00, &namePtr);
+                (void)ReadTargetPointer((const BYTE*)data + 0x08, &valuePtr);
+                (void)CopyTargetMemory((const BYTE*)data + 0x10,
+                                       &version, sizeof(version));
+                (void)CopyTargetMemory((const BYTE*)data + 0x12,
+                                       &id, sizeof(id));
+                (void)CopyWideString(nameText, RSI_ENGINE_WORK_KIND_CHARS,
+                                     (const wchar_t*)namePtr, 0);
+                (void)CopyWideString(valueText,
+                                     RSI_ENGINE_WORK_TARGET_CHARS,
+                                     (const wchar_t*)valuePtr, 0);
+            }
+        }
+
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime,
+                        (UINT32)eventType, 0, (UINT32)version, (UINT32)id,
+                        nameText, valueText, NULL, NULL, 0);
+        return;
+    }
+
+    if (kind == RSI_ENGINE_KIND_MOAC) {
+        UINT64  lookup[2] = { 0, 0 };
+        UINT64  fileId[2] = { 0, 0 };
+        UINT64  id = 0;
+        UINT64  nameLength = 0;
+        UINT32  flag = 0;
+        PVOID   namePtr = NULL;
+        BYTE    lookupBytes[16];
+        wchar_t guidText[64];
+        wchar_t nameText[RSI_ENGINE_WORK_TARGET_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        nameText[0] = L'\0';
+        detailText[0] = L'\0';
+        guidText[0] = L'\0';
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x08,
+                                   &lookup[0], sizeof(lookup[0]));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x10,
+                                   &lookup[1], sizeof(lookup[1]));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x18,
+                                   &fileId[0], sizeof(fileId[0]));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x20,
+                                   &fileId[1], sizeof(fileId[1]));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x28,
+                                   &id, sizeof(id));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x30,
+                                   &flag, sizeof(flag));
+            (void)ReadTargetPointer((const BYTE*)payload + 0x38, &namePtr);
+            (void)CopyTargetMemory((const BYTE*)payload + 0x40,
+                                   &nameLength, sizeof(nameLength));
+            (void)ReadNameAuto(namePtr, nameLength, nameText,
+                               ARRAYSIZE(nameText));
+        }
+
+        memcpy(lookupBytes, lookup, sizeof(lookupBytes));
+        FormatGuidText(lookupBytes, guidText, ARRAYSIZE(guidText));
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"lookup=%s fileid=%016llX%016llX id=0x%llX "
+                           L"flag=%u",
+                           guidText,
+                           (unsigned long long)fileId[0],
+                           (unsigned long long)fileId[1],
+                           (unsigned long long)id,
+                           (unsigned)flag);
+
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 1, flag, 0, 0,
+                        L"moaclookup", nameText, detailText, NULL, 0);
+        return;
+    }
+
+    if (kind == RSI_ENGINE_KIND_MOAC_LEGACY) {
+        UINT32  type = 0;
+        UINT64  handle = 0;
+        UINT64  id = 0;
+        UINT64  nameLength = 0;
+        UINT32  flag = 0;
+        PVOID   namePtr = NULL;
+        wchar_t nameText[RSI_ENGINE_WORK_TARGET_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        nameText[0] = L'\0';
+        detailText[0] = L'\0';
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &type, sizeof(type));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x08,
+                                   &handle, sizeof(handle));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x18,
+                                   &id, sizeof(id));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x20,
+                                   &flag, sizeof(flag));
+            (void)ReadTargetPointer((const BYTE*)payload + 0x28, &namePtr);
+            (void)CopyTargetMemory((const BYTE*)payload + 0x30,
+                                   &nameLength, sizeof(nameLength));
+            (void)ReadNameAuto(namePtr, nameLength, nameText,
+                               ARRAYSIZE(nameText));
+        }
+
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"handle=0x%llX id=0x%llX flag=%u",
+                           (unsigned long long)handle,
+                           (unsigned long long)id,
+                           (unsigned)flag);
+
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, type, flag, 0, 0,
+                        L"moaclookup", nameText, detailText, NULL, 0);
+        return;
+    }
+
     if (kind == RSI_ENGINE_KIND_WORK) {
         PVOID   args = NULL;
         PVOID   kindTextPtr = NULL;
@@ -1420,7 +1764,8 @@ EmitEngineTraceRecord(
             (void)CopyTargetMemory((const BYTE*)payload +
                                        RSI_ENGINE_WORK_PAYLOAD_FLAGS,
                                    &flags, sizeof(flags));
-            if (ReadTargetPointer((const BYTE*)payload +
+            if (opcode == RSI_ENGINE_WORK_OPCODE_DEFERRED &&
+                ReadTargetPointer((const BYTE*)payload +
                                       RSI_ENGINE_WORK_PAYLOAD_ARGS,
                                   &args) &&
                 args != NULL) {
@@ -1444,9 +1789,249 @@ EmitEngineTraceRecord(
             }
         }
 
-        EmitEngineTrace((UINT32)kind, engineTime, opcode, flags,
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, opcode, flags,
                         (UINT32)version, (UINT32)id, kindText, targetText,
-                        NULL, 0);
+                        NULL, NULL, 0);
+        return;
+    }
+
+    /*
+     * 0x22/0x23 are the engine's host data channel: {u32 length; u32 pad;
+     * void *buffer; u32 value; u32 pad; u64 extra}.  The engine reads a blob
+     * from the host (0x22) or hands one to it (0x23); the host may rewrite
+     * "length" at +0x00, in which case the engine discards/zeroes the buffer.
+     */
+    if (kind == RSI_ENGINE_KIND_HOST_READ ||
+        kind == RSI_ENGINE_KIND_HOST_WRITE) {
+        UINT32  length = 0;
+        UINT32  value = 0;
+        UINT64  buffer = 0;
+        UINT64  extra = 0;
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &length, sizeof(length));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x08,
+                                   &buffer, sizeof(buffer));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x10,
+                                   &value, sizeof(value));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x18,
+                                   &extra, sizeof(extra));
+        }
+
+        if (kind == RSI_ENGINE_KIND_HOST_READ) {
+            (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                               L"len=%u buffer=0x%llX value=0x%X",
+                               (unsigned)length,
+                               (unsigned long long)buffer,
+                               (unsigned)value);
+            EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                            L"hostread", NULL, detailText, NULL, 0);
+        } else {
+            (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                               L"len=%u buffer=0x%llX value=0x%X "
+                               L"extra=0x%llX",
+                               (unsigned)length,
+                               (unsigned long long)buffer,
+                               (unsigned)value,
+                               (unsigned long long)extra);
+            EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                            L"hostwrite", NULL, detailText, NULL, 0);
+        }
+        return;
+    }
+
+    /*
+     * 0x25 payload holds the wchar_t* stage message the scan pipeline just
+     * formatted, e.g. L"START:Engine quick scan variant, type 0x...".
+     */
+    if (kind == RSI_ENGINE_KIND_SCAN_STAGE) {
+        wchar_t stageText[RSI_ENGINE_MESSAGE_CHARS];
+
+        stageText[0] = L'\0';
+        if (payload != NULL) {
+            ReadStageText(payload, stageText, ARRAYSIZE(stageText));
+        }
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        L"scanstage", stageText, NULL, NULL, 0);
+        return;
+    }
+
+    /*
+     * 0x1A and 0x37 are MOAC entry serializations.  Both start with the same
+     * 16-byte lookup GUID; 0x37 is the 0x40-byte form, 0x1A the 0x50-byte one.
+     */
+    if (kind == RSI_ENGINE_KIND_MOAC_ENTRY ||
+        kind == RSI_ENGINE_KIND_MOAC_ENTRY_R) {
+        BYTE    guidBytes[16];
+        wchar_t guidText[64];
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+        UINT32  qwordCount;
+
+        ZeroMemory(guidBytes, sizeof(guidBytes));
+        guidText[0] = L'\0';
+        fields[0] = L'\0';
+        detailText[0] = L'\0';
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory(payload, guidBytes, sizeof(guidBytes));
+            qwordCount = (kind == RSI_ENGINE_KIND_MOAC_ENTRY_R) ? 4 : 5;
+            FormatQwordFields((const BYTE*)payload, 0x10, qwordCount,
+                              fields, ARRAYSIZE(fields));
+            FormatGuidText(guidBytes, guidText, ARRAYSIZE(guidText));
+            (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                               L"lookup=%s %s", guidText, fields);
+        }
+
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        L"moacentry", NULL, detailText, NULL, 0);
+        return;
+    }
+
+    /* 0x1F is the result buffer of one MOAC v2 attempt (32 bytes, host filled). */
+    if (kind == RSI_ENGINE_KIND_MOAC_V2) {
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+
+        fields[0] = L'\0';
+        FormatQwordFields((const BYTE*)payload, 0x00, 4, fields,
+                          ARRAYSIZE(fields));
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        L"moacv2", NULL, fields, NULL, 0);
+        return;
+    }
+
+    /* 0x2A is a notification record: {u32 type=6; u32 pad; u64 object; ...}. */
+    if (kind == RSI_ENGINE_KIND_NOTIFICATION) {
+        UINT32  type = 0;
+        UINT64  object = 0;
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        fields[0] = L'\0';
+        detailText[0] = L'\0';
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &type, sizeof(type));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x08,
+                                   &object, sizeof(object));
+            FormatQwordFields((const BYTE*)payload, 0x10, 4, fields,
+                              ARRAYSIZE(fields));
+        }
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"type=%u object=0x%llX %s",
+                           (unsigned)type,
+                           (unsigned long long)object,
+                           fields);
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, type, 0, 0, 0,
+                        L"notification", NULL, detailText, NULL, 0);
+        return;
+    }
+
+    /*
+     * 0x3D/0x3E bracket a host configuration query: the engine allocates a
+     * 0x20-byte out-buffer (first u32 is the version, observed 0x101), lets
+     * the host fill it (0x3D) and then releases it (0x3E).
+     */
+    if (kind == RSI_ENGINE_KIND_HOST_CONFIG ||
+        kind == RSI_ENGINE_KIND_HOST_RELEASE) {
+        UINT32  version = 0;
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        fields[0] = L'\0';
+        detailText[0] = L'\0';
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &version, sizeof(version));
+            FormatQwordFields((const BYTE*)payload, 0x08, 3, fields,
+                              ARRAYSIZE(fields));
+        }
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"version=0x%X %s", (unsigned)version, fields);
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, version, 0, 0, 0,
+                        L"hostconfig", NULL, detailText, NULL, 0);
+        return;
+    }
+
+    /* 0x44 is the RTP/iClientInfo monitoring state update ("UpdateMonitoringToRTP"). */
+    if (kind == RSI_ENGINE_KIND_RTP_UPDATE) {
+        UINT32  type = 0;
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        fields[0] = L'\0';
+        detailText[0] = L'\0';
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &type, sizeof(type));
+            FormatQwordFields((const BYTE*)payload, 0x08, 4, fields,
+                              ARRAYSIZE(fields));
+        }
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"type=%u %s", (unsigned)type, fields);
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, type, 0, 0, 0,
+                        L"rtpupdate", NULL, detailText, NULL, 0);
+        return;
+    }
+
+    /*
+     * 0x52 carries the host's remediation configuration; the engine reads
+     * routineactiondelay (+0x00), routineactionmaxdelay (+0x04),
+     * disableroutinelytakingaction (+0x08) and three option values.
+     */
+    if (kind == RSI_ENGINE_KIND_REMEDIATION) {
+        UINT32  delay = 0;
+        UINT32  maxDelay = 0;
+        UINT32  disable = 0;
+        UINT32  option1 = 0;
+        UINT32  option2 = 0;
+        UINT32  option4 = 0;
+        UINT32  option5 = 0;
+        wchar_t detailText[RSI_ENGINE_DETAIL_CHARS];
+
+        if (payload != NULL) {
+            (void)CopyTargetMemory((const BYTE*)payload + 0x00,
+                                   &delay, sizeof(delay));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x04,
+                                   &maxDelay, sizeof(maxDelay));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x08,
+                                   &disable, sizeof(disable));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x0C,
+                                   &option1, sizeof(option1));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x10,
+                                   &option2, sizeof(option2));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x14,
+                                   &option4, sizeof(option4));
+            (void)CopyTargetMemory((const BYTE*)payload + 0x18,
+                                   &option5, sizeof(option5));
+        }
+        (void)_snwprintf_s(detailText, ARRAYSIZE(detailText), _TRUNCATE,
+                           L"delay=%u maxdelay=%u disable=%u opt1=%u opt2=%u "
+                           L"opt4=%u opt5=%u",
+                           (unsigned)delay, (unsigned)maxDelay,
+                           (unsigned)disable, (unsigned)option1,
+                           (unsigned)option2, (unsigned)option4,
+                           (unsigned)option5);
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        L"remediation", NULL, detailText, NULL, 0);
+        return;
+    }
+
+    /*
+     * 0x13/0x15 are notification records forwarded verbatim by
+     * FUN_1804b6fb0; only the first four qwords are rendered because the
+     * tail depends on the notification type.
+     */
+    if (kind == RSI_ENGINE_KIND_NOTIFY || kind == RSI_ENGINE_KIND_NOTIFY_ALT) {
+        wchar_t fields[RSI_ENGINE_DETAIL_CHARS];
+
+        fields[0] = L'\0';
+        FormatQwordFields((const BYTE*)payload, 0x00, 4, fields,
+                          ARRAYSIZE(fields));
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        L"notification", NULL, fields, NULL, 0);
         return;
     }
 
@@ -1459,7 +2044,8 @@ EmitEngineTraceRecord(
             payloadRead = CopyTargetMemory(payload, payloadBytes,
                                            sizeof(payloadBytes));
         }
-        EmitEngineTrace((UINT32)kind, engineTime, 0, 0, 0, 0, NULL, NULL,
+        EmitEngineTrace((UINT32)kind, callerRva, engineTime, 0, 0, 0, 0,
+                        NULL, NULL, NULL,
                         (payloadRead != 0) ? payloadBytes : NULL,
                         payloadRead);
     }
@@ -1479,7 +2065,7 @@ Hook_EngineTrace(
      */
     if (InterlockedIncrement(&g_InEngineLog) == 1 &&
         TraceLoggingProviderEnabled(g_hRSignalProvider, 0, 0)) {
-        EmitEngineTraceRecord(Record);
+        EmitEngineTraceRecord(Record, _ReturnAddress());
     }
 
     status = (real != NULL) ? real(Record) : 0;
@@ -1653,8 +2239,11 @@ HookMaintenanceThread(
         HMODULE engine = GetModuleHandleW(MPENGINE_DLL_WNAME);
 
         if (engine != NULL) {
+            g_EngineModuleBase = (PVOID)engine;
             (void)TryInstallHook(engine);
             ArmEngineLog((const BYTE*)engine);
+        } else {
+            g_EngineModuleBase = NULL;
         }
 
         Sleep(RSI_ENGINE_LOG_POLL_MS);
