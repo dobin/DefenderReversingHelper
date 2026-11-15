@@ -63,7 +63,10 @@ extern "C" {
 #define MP_TELEMETRY_TYPE_HELLO       2u
 #define MP_TELEMETRY_TYPE_HELLO_REPLY 3u
 
-/* Header.Event (telemetry event kind, not an mpengine note id). */
+/* Header.Event (telemetry event kind, not an mpengine note id).  Process
+ * events carry ParentProcessId, and CreateTime is the process creation time
+ * (for PROCESS_EXIT it is the key of the process that stopped; both derive
+ * from the PEPROCESS in the notify callback). */
 #define MP_TELEMETRY_EVENT_PROCESS_CREATE   0x0001u
 #define MP_TELEMETRY_EVENT_PROCESS_EXIT     0x0002u
 #define MP_TELEMETRY_EVENT_FILE_CREATE      0x0010u

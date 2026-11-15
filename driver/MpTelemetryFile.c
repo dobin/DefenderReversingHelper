@@ -153,10 +153,11 @@ MpTelemetryPostCreateEmit(
 
     options = Data->Iopb->Parameters.Create.Options;
     attributes = Data->Iopb->Parameters.Create.FileAttributes;
-    if ((options & FILE_DIRECTORY_FILE) != 0) {
-        return;
-    }
     disposition = (options >> 24) & 0xFFu;
+
+    /* A directory create is reported too (live Defender emits 1/0x100 for the
+     * scenario directory with a zeroed record), but the consumer keeps it out
+     * of the dirty set so no close/scan follows. */
 
     /* Options carries the FILE_* disposition in the high byte; the consumer
      * uses it to tell a plain read open from a create/overwrite.  Omitting it
@@ -256,6 +257,9 @@ MpTelemetryPreCreate(
                    FILE_WRITE_ATTRIBUTES | DELETE | GENERIC_WRITE |
                    MAXIMUM_ALLOWED)) != 0) {
         flags |= MP_TELEMETRY_FLAG_WRITE_ACCESS;
+    }
+    if ((Data->Iopb->Parameters.Create.Options & FILE_DIRECTORY_FILE) != 0) {
+        flags |= MP_TELEMETRY_FLAG_DIRECTORY;
     }
     *CompletionContext = (PVOID)(ULONG_PTR)flags;
 

@@ -29,6 +29,16 @@
 #include "MpTelemetry.h"
 #include "PplLog.h"
 
+/* The installed WDK headers do not declare the parent lookup, although
+ * ntoskrnl exports it and the WDK documents it under ntifs.h.  The exit
+ * callback has no PS_CREATE_NOTIFY_INFO, so this is the only way to key the
+ * stop note by the parent without keeping a pid table in the driver. */
+NTKERNELAPI
+HANDLE
+NTAPI
+PsGetProcessInheritedFromUniqueProcessId(
+    _In_ PEPROCESS Process);
+
 MP_TELEMETRY_STATE g_Telemetry;
 
 /*
@@ -440,8 +450,17 @@ MpTelemetryProcessNotify(
     }
 
     if (CreateInfo == NULL) {
+        /* The exit callback still owns a valid PEPROCESS, so the process key
+         * that the consumer's stop note needs can be stamped here: Defender
+         * attributes a stop to the parent's context and keys the note by
+         * {create time, pid} for both the parent and the exiting process.
+         * The parent link is fixed at creation and survives the exit. */
+        parentPid = (ULONG)(ULONG_PTR)
+            PsGetProcessInheritedFromUniqueProcessId(Process);
+        createTime = (UINT64)PsGetProcessCreateTimeQuadPart(Process);
         (void)MpTelemetrySendEvent(pid, MP_TELEMETRY_EVENT_PROCESS_EXIT, 0,
-                                   0, 0, 0, 0, 0, NULL, 0, NULL, 0, NULL);
+                                   parentPid, 0, 0, 0, createTime,
+                                   NULL, 0, NULL, 0, NULL);
         return;
     }
 

@@ -57,8 +57,8 @@ typedef struct _MP_TELEMETRY_EVENT {
 | Wire event | Value | Consumer note |
 |---|---|---|
 | `PROCESS_CREATE` | `0x0001` | process note event 1, image + create time |
-| `PROCESS_EXIT` | `0x0002` | counted only |
-| `FILE_CREATE` | `0x0010` | `MP_RTP_FILE_CREATE` (requestor create time) |
+| `PROCESS_EXIT` | `0x0002` | `MP_RTP_PROCESS_STOP` (5) in the parent's context, with the exiting and parent keys; no image |
+| `FILE_CREATE` | `0x0010` | `MP_RTP_FILE_CREATE` (requestor create time); a directory create carries `FLAG_DIRECTORY` and a zeroed record |
 | `FILE_WRITE` | `0x0011` | `MP_RTP_FILE_WRITE` when enabled |
 | `FILE_CLOSE` | `0x0012` | `mp_rtp_note_file_close` (0xf0 close record) if dirty |
 | `FILE_RENAME` | `0x0013` | rename note (both paths, requestor create time) |
@@ -69,8 +69,11 @@ typedef struct _MP_TELEMETRY_EVENT {
 `CreateTime` is the requestor process creation FILETIME for every event that
 carries a process id: `PsGetProcessCreateTimeQuadPart` of the current process,
 or a `PsLookupProcessByProcessId` at PASSIVE_LEVEL for a foreign requestor.
-The engine keys its ProcessInfoMap by `{create time, pid}` and compares both
-halves, so a zero value leaves the note unattributable.
+`PROCESS_EXIT` stamps it from its own `PEPROCESS`, together with
+`ParentProcessId` from `PsGetProcessInheritedFromUniqueProcessId`, because the
+exit callback has no `PS_CREATE_NOTIFY_INFO`.  The engine keys its
+ProcessInfoMap by `{create time, pid}` and compares both halves, so a zero value
+leaves the note unattributable.
 
 `FILE_CREATE` carries the `NtCreateFile` disposition in the high byte of
 `CreateOptions`.  `Flags` bit `0x8` (`WRITE_ACCESS`) is set when the requested
@@ -81,7 +84,7 @@ APC still does.
 
 ### Handshake
 
-The consumer sends `MP_TELEMETRY_HELLO` (`Type = HELLO`, version 1) with
+The consumer sends `MP_TELEMETRY_HELLO` (`Type = HELLO`, version 2) with
 `FilterSendMessage`. The driver's message callback validates the version and
 returns `MP_TELEMETRY_HELLO_REPLY` with `MaxMessage` and `DriverVersion`.
 A mismatch stops the consumer with `MP_E_LAYOUT_UNKNOWN`.
@@ -96,8 +99,9 @@ minifilter operation table and the file callbacks.
   MaxConnections = 1)` + `FltStartFiltering`.
 - `PsSetCreateProcessNotifyRoutineEx` for process create/exit.
 - Minifilter callbacks:
-  - `IRP_MJ_CREATE` post-op: skip failed/directory creates, send
-    `FILE_CREATE`. The filter manager can deliver a create completion at
+  - `IRP_MJ_CREATE` post-op: send `FILE_CREATE` (a directory create sets
+    `FLAG_DIRECTORY`; the consumer reports it without dirty marking). The
+    filter manager can deliver a create completion at
     `DISPATCH_LEVEL` when the create pended. Name lookup and `FltSendMessage`
     are illegal there, so the callback defers through
     `FltDoCompletionProcessingWhenSafe`. Simply returning (as an earlier
